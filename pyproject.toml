@@ -1,0 +1,9 @@
+[project]
+name = "road-angle"
+version = "0.1.0"
+description = "純雙目立體視覺預測前方路面縱向坡度 (pitch)，IMU 當輔助校正"
+readme = "README.md"
+requires-python = ">=3.13"
+# cv2 / numpy / av 沿用系統 (Pi 硬體最佳化版)，透過 --system-site-packages 繼承，
+# 不列在這裡避免 uv 去 pip 裝一份未最佳化的 opencv。
+dependencies = []
