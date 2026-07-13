@@ -64,7 +64,10 @@ class StereoWorker(QThread):
             from .recorder import SessionRecorder
 
             recorder = SessionRecorder(
-                self.config.output_dir, self.calib.native_size, self.config.record_fps
+                self.config.output_dir,
+                self.calib.native_size,
+                self.config.record_fps,
+                self.config.segment_seconds,
             )
         t_prev = time.monotonic()
         fps = 0.0

@@ -174,8 +174,10 @@ def _run_live(calib, args, *, record: bool = False) -> int:
     if record:
         from .recorder import SessionRecorder
 
-        recorder = SessionRecorder(DEFAULT.output_dir, calib.native_size, DEFAULT.record_fps)
-        print(f"錄影中 → {recorder.dir}")
+        recorder = SessionRecorder(
+            DEFAULT.output_dir, calib.native_size, DEFAULT.record_fps, DEFAULT.segment_seconds
+        )
+        print(f"錄影中 → {recorder.dir}（每 {DEFAULT.segment_seconds:.0f} 秒收一段）")
     results = process_live(calib, config=DEFAULT, max_frames=args.limit, recorder=recorder)
     writer_ctx = _open_csv(Path(args.out)) if args.out else _null_csv()
     pitches: list[float] = []
@@ -188,8 +190,9 @@ def _run_live(calib, args, *, record: bool = False) -> int:
         print("\n已停止 (Ctrl+C)。")
     finally:
         if recorder is not None:
-            seg = recorder.close()
-            print(f"已存：{seg}/cam0.mp4, cam1.mp4, road_angle.csv, road_angle_trend.png")
+            recorder.close()
+            n = len(recorder.segments)
+            print(f"已存 {n} 段 → {DEFAULT.output_dir}/（每段含 cam0/cam1.mp4, road_angle.csv, road_angle_trend.png）")
     if args.out:
         print(f"CSV → {args.out}")
     _print_summary(pitches)

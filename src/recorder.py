@@ -40,29 +40,56 @@ def next_segment_dir(output_dir: str | Path) -> Path:
 
 
 class SessionRecorder:
-    """錄 cam0/cam1 影片、累積每幀結果，結束時輸出 CSV + 趨勢圖。"""
+    """錄 cam0/cam1 影片、累積每幀結果，輸出 CSV + 趨勢圖。
 
-    def __init__(self, output_dir: str | Path, size: tuple[int, int], fps: float) -> None:
-        self.dir = next_segment_dir(output_dir)
-        w, h = size
+    segment_seconds > 0 時每滿這麼多秒就把當前 segment 收好、換下一段遞增編號
+    （output/segment_NNN/），跑越久也不怕中途掛掉。設 0 = 不輪替、只在 close()
+    收尾（舊行為）。每段的 time_s 都從該段開始 0 重新計。
+    """
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        size: tuple[int, int],
+        fps: float,
+        segment_seconds: float = 0.0,
+    ) -> None:
+        self.output_dir = output_dir
+        self.size = size
+        self.fps = fps
+        self.segment_seconds = segment_seconds
+        self.segments: list[Path] = []
+        self._open_segment()
+
+    def _open_segment(self) -> None:
+        self.dir = next_segment_dir(self.output_dir)
+        self.segments.append(self.dir)
+        w, h = self.size
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self.vw0 = cv2.VideoWriter(str(self.dir / "cam0.mp4"), fourcc, fps, (w, h))
-        self.vw1 = cv2.VideoWriter(str(self.dir / "cam1.mp4"), fourcc, fps, (w, h))
+        self.vw0 = cv2.VideoWriter(str(self.dir / "cam0.mp4"), fourcc, self.fps, (w, h))
+        self.vw1 = cv2.VideoWriter(str(self.dir / "cam1.mp4"), fourcc, self.fps, (w, h))
         self._results: list[FrameResult] = []
         self._times: list[float] = []
         self._t0 = time.monotonic()
 
+    def _finalize_segment(self) -> None:
+        self.vw0.release()
+        self.vw1.release()
+        self._write_csv()
+        self._write_trend()
+
     def add(self, img0: np.ndarray, img1: np.ndarray, fr: FrameResult) -> None:
+        # 當前 segment 滿了就先收好、再開新的一段（下面這幀寫進新段）。
+        if self.segment_seconds > 0 and (time.monotonic() - self._t0) >= self.segment_seconds:
+            self._finalize_segment()
+            self._open_segment()
         self.vw0.write(img0)
         self.vw1.write(img1)
         self._results.append(fr)
         self._times.append(time.monotonic() - self._t0)
 
     def close(self) -> Path:
-        self.vw0.release()
-        self.vw1.release()
-        self._write_csv()
-        self._write_trend()
+        self._finalize_segment()
         return self.dir
 
     def _write_csv(self) -> None:
