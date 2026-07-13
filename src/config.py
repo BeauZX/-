@@ -41,7 +41,7 @@ class Config:
     depth_scale: float = 1000.0
 
     # === 路面選點範圍（相機座標，公尺）===
-    z_min_m: float = 0.5  # 最近距離（量「前方」路面，跳過腳下近路）
+    z_min_m: float = 7  # 最近距離（量「前方」路面，跳過腳下近路）
     z_max_m: float = 20.0  # 最遠距離（20m 內單點誤差 <~21%，擬平面後角度可靠）
     y_min_m: float = -0.5  # 路面在相機下方(Y 向下為正)，排除天空/高處
     # 註：影像橫帶的限制已由 disparity_roi_fraction 在算視差前處理，這裡不再重複裁列。
@@ -61,6 +61,11 @@ class Config:
     live_cam0_index: int = 0  # Picamera2 index：0 = i2c@88000 = cam0(左)
     live_cam1_index: int = 1  # 1 = i2c@80000 = cam1(右)
 
+    # === ROI 記憶 ===
+    # UI 拉框設好的 ROI 會存到這個檔，下次開視窗自動套用（框仍可重拉覆蓋、雙擊清除）。
+    # 存的是 process 座標 + process_size 防呆：換解析度使舊框作廢時自動忽略。
+    roi_path: str = "roi.json"
+
     # === 介面開關 ===
     # True → 即時模式開 PyQt 視覺視窗（影像+路面塗色+坡度角）；
     # False → 純終端機印數字（較快、可 headless）。CLI --ui / --no-ui 可覆寫。
@@ -75,7 +80,7 @@ class Config:
     # 每滿這麼多秒就把當前 segment 收好（寫 CSV/趨勢圖、封 mp4）、換下一段遞增編號。
     # 好處：即時模式跑越久也不怕中途掛掉——最多只損失最後不到這段時間的資料。
     # 設 0（或負值）= 不輪替，維持舊行為（整段只在 Ctrl+C 停止時才一次寫出）。
-    segment_seconds: float = 120.0  # 2 分鐘
+    segment_seconds: float = 60.0  # 1 分鐘
 
 
 # 全域預設；整個管線都用它，除非呼叫端特別覆寫。

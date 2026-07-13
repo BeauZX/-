@@ -6,5 +6,7 @@ dist/
 wheels/
 *.egg-info
 *output
+# UI 記住的 ROI（執行時產生、跟相機安裝位置綁定，非版控內容）
+roi.json
 # Virtual environments
 .venv

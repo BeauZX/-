@@ -94,9 +94,13 @@ def estimate_pair(
     img0: np.ndarray,
     img1: np.ndarray,
     time_diff_ms: float | None = None,
+    roi: tuple[int, int, int, int] | None = None,
 ) -> FrameResult:
-    """單一左右幀對 → 路面坡度。離線(process_segment)與即時(process_live)共用。"""
-    res = compute_stereo(calib, matcher, img0, img1)
+    """單一左右幀對 → 路面坡度。離線(process_segment)與即時(process_live)共用。
+
+    roi=(x0,y0,x1,y1)（process 座標）時只在框內算視差；None 退回預設下方橫帶。
+    """
+    res = compute_stereo(calib, matcher, img0, img1, roi)
     return estimate_from_result(config, rng, index, res, time_diff_ms)
 
 
@@ -124,10 +128,13 @@ def process_live(
     config: Config = DEFAULT,
     max_frames: int | None = None,
     recorder=None,
+    roi: tuple[int, int, int, int] | None = None,
 ) -> Iterator[FrameResult]:
     """接兩顆即時鏡頭，逐幀產生路面坡度結果，直到 Ctrl+C 或達到 max_frames。
 
     recorder（SessionRecorder，可選）非 None 時，每幀把原生 cam0/cam1 錄下來。
+    roi（process 座標，可選）非 None 時只在框內算視差——headless 用它套用 UI 記住
+    的 roi.json，跟 UI 模式吃同一個框。
     """
     from .live import LiveStereo  # 延後 import：只有即時模式才需要 picamera2
 
@@ -137,7 +144,7 @@ def process_live(
     with LiveStereo(config, size=calib.image_size) as cams:
         i = 0
         for img0, img1 in cams.frames():
-            fr = estimate_pair(calib, matcher, config, rng, i, img0, img1, None)
+            fr = estimate_pair(calib, matcher, config, rng, i, img0, img1, None, roi)
             if recorder is not None:
                 recorder.add(img0, img1, fr)
             yield fr

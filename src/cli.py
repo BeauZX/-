@@ -178,7 +178,14 @@ def _run_live(calib, args, *, record: bool = False) -> int:
             DEFAULT.output_dir, calib.native_size, DEFAULT.record_fps, DEFAULT.segment_seconds
         )
         print(f"錄影中 → {recorder.dir}（每 {DEFAULT.segment_seconds:.0f} 秒收一段）")
-    results = process_live(calib, config=DEFAULT, max_frames=args.limit, recorder=recorder)
+    from .roi_store import load_roi  # headless 沿用 UI 記住的 ROI（roi.json）
+
+    roi = load_roi(DEFAULT.roi_path, calib.process_size)
+    if roi is not None:
+        print(f"套用記住的 ROI {roi}（來自 {DEFAULT.roi_path}；UI 拉框設定/雙擊清除）")
+    results = process_live(
+        calib, config=DEFAULT, max_frames=args.limit, recorder=recorder, roi=roi
+    )
     writer_ctx = _open_csv(Path(args.out)) if args.out else _null_csv()
     pitches: list[float] = []
     try:
