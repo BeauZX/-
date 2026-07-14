@@ -4,10 +4,14 @@
 預覽更順好瞄準），把框調到滿意後按 **Enter** 才進入「預測階段」（開始算角度並錄影）。
 （headless 純 `--live` 不經過本 worker、不需 Enter，一律直接跑。）
 
-預測階段畫面＝左鏡頭即時影像，疊上：
+預測階段畫面＝cam0(左)與 cam1(右)兩顆校正後影像**並排**（讓人一眼看到雙目
+都在跑，深度是左右一起算的），左圖(cam0=參考影像)疊上：
   - 綠色：被判定為路面、拿去算坡度的那片點（＝角度的依據，越乾淨越可信）
   - 黃框：目前的 ROI（只在框內算視差）
   - 文字：前方路面坡度、RMS(擬合殘差)、內點比例、fps
+右圖(cam1)只疊黃色 ROI 框：綠色內點是 cam0 像素座標，右圖同像素被視差平移，
+畫上去會錯位，所以右圖單純呈現「另一顆鏡頭的即時校正畫面」。滑鼠拉框設 ROI
+只在左圖(cam0)座標系生效。
 
 滑鼠操作（兩階段都可用）：
   - 在影像上「拖一個方框」＝設定 ROI（只算框內，聚焦到路面），會存進 roi.json 記住
@@ -82,7 +86,7 @@ class StereoWorker(QThread):
                     if not self.active:
                         pw, ph = self.calib.process_size
                         rect = self._roi_rect(pw, ph, matcher.roi_fraction)
-                        self.frameReady.emit(self._draw_preview(rect0, rect), None)
+                        self.frameReady.emit(self._draw_preview(rect0, rect1, rect), None)
                         continue
 
                     # 第一幀 active 才建立錄影器（此後每 segment_seconds 自動輪替）
@@ -122,7 +126,7 @@ class StereoWorker(QThread):
                     fps = 0.9 * fps + 0.1 * (1.0 / max(1e-6, now - t_prev))
                     t_prev = now
 
-                    qimg = self._draw(rect0, res, plane, fr, fps)
+                    qimg = self._draw(rect0, rect1, res, plane, fr, fps)
                     self.frameReady.emit(qimg, fr)
                     i += 1
         finally:
@@ -130,25 +134,29 @@ class StereoWorker(QThread):
                 seg = recorder.close()
                 self.sessionSaved.emit(str(seg))
 
-    def _draw(self, rect0, res, plane, fr: FrameResult, fps: float) -> QImage:
-        base = rect0.copy()
-        if base.ndim == 2:
-            base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+    def _draw(self, rect0, rect1, res, plane, fr: FrameResult, fps: float) -> QImage:
+        left = _as_bgr(rect0)
+        right = _as_bgr(rect1)
         x0, y0 = res.x0, res.y0
         h_roi, w_roi = res.pts.shape[:2]
 
-        # 綠色：路面內點（角度的依據）
+        # 綠色：路面內點（角度的依據）。只畫在左(cam0)：mask 是 cam0 像素座標，
+        # 右圖同像素被視差平移，塗上去會錯位。
         if plane is not None:
             mask = plane_inlier_mask(res.pts, res.valid, plane, self.config.ransac_threshold_m)
-            sub = base[y0 : y0 + h_roi, x0 : x0 + w_roi]
+            sub = left[y0 : y0 + h_roi, x0 : x0 + w_roi]
             sub[mask] = (0.4 * sub[mask] + 0.6 * np.array([0, 255, 0])).astype(np.uint8)
 
-        # 黃框：ROI
-        cv2.rectangle(base, (x0, y0), (x0 + w_roi, y0 + h_roi), (0, 255, 255), 1)
+        # 黃框：ROI（兩顆都畫，強調左右一起算視差）
+        cv2.rectangle(left, (x0, y0), (x0 + w_roi, y0 + h_roi), (0, 255, 255), 1)
+        cv2.rectangle(right, (x0, y0), (x0 + w_roi, y0 + h_roi), (0, 255, 255), 1)
+        _panel_label(left, "L - cam0 (ref)")
+        _panel_label(right, "R - cam1")
 
-        # 放大顯示
+        # 並排合成後再放大（左圖仍起於 x=0，滑鼠 ROI 對映不變）
+        combo = _compose_lr(left, right)
         big = cv2.resize(
-            base, (base.shape[1] * DISPLAY_SCALE, base.shape[0] * DISPLAY_SCALE),
+            combo, (combo.shape[1] * DISPLAY_SCALE, combo.shape[0] * DISPLAY_SCALE),
             interpolation=cv2.INTER_NEAREST,
         )
         _draw_text(big, plane, fr, fps)
@@ -169,16 +177,19 @@ class StereoWorker(QThread):
         y0 = int(ph * (1.0 - roi_fraction)) if roi_fraction < 1.0 else 0
         return 0, y0, pw, ph
 
-    def _draw_preview(self, rect0, roi_rect: tuple[int, int, int, int]) -> QImage:
-        """框選階段的畫面：校正後預覽 + 黃色 ROI 框 + 「按 Enter 開始」提示（英文，
-        避免 cv2 Hershey 畫不出中文變 ??? ）。"""
-        base = rect0.copy()
-        if base.ndim == 2:
-            base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+    def _draw_preview(self, rect0, rect1, roi_rect: tuple[int, int, int, int]) -> QImage:
+        """框選階段的畫面：cam0/cam1 校正後並排預覽 + 黃色 ROI 框 + 「按 Enter 開始」
+        提示（英文，避免 cv2 Hershey 畫不出中文變 ??? ）。"""
+        left = _as_bgr(rect0)
+        right = _as_bgr(rect1)
         x0, y0, x1, y1 = roi_rect
-        cv2.rectangle(base, (x0, y0), (x1, y1), (0, 255, 255), 1)
+        cv2.rectangle(left, (x0, y0), (x1, y1), (0, 255, 255), 1)
+        cv2.rectangle(right, (x0, y0), (x1, y1), (0, 255, 255), 1)
+        _panel_label(left, "L - cam0 (ref)")
+        _panel_label(right, "R - cam1")
+        combo = _compose_lr(left, right)
         big = cv2.resize(
-            base, (base.shape[1] * DISPLAY_SCALE, base.shape[0] * DISPLAY_SCALE),
+            combo, (combo.shape[1] * DISPLAY_SCALE, combo.shape[0] * DISPLAY_SCALE),
             interpolation=cv2.INTER_NEAREST,
         )
         for text, col in (("Frame road ROI", (0, 255, 255)),
@@ -190,6 +201,27 @@ class StereoWorker(QThread):
         rgb = cv2.cvtColor(big, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+
+
+def _as_bgr(rect) -> np.ndarray:
+    """校正影像轉可疊色的 BGR 副本（灰階→BGR，彩色則 copy 不動原圖）。"""
+    img = rect.copy()
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    return img
+
+
+def _compose_lr(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """cam0(左)、cam1(右)水平並排，中間一條深灰分隔線。兩者同為 process_size。"""
+    sep = np.full((left.shape[0], 4, 3), 60, np.uint8)
+    return np.hstack([left, sep, right])
+
+
+def _panel_label(img: np.ndarray, text: str) -> None:
+    """在單一 panel 左下角標 L/R 鏡頭來源（黑描邊 + 黃字）。"""
+    y = img.shape[0] - 6
+    cv2.putText(img, text, (6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
+    cv2.putText(img, text, (6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
 
 def _draw_text(img, plane, fr: FrameResult, fps: float) -> None:

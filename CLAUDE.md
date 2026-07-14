@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 純雙目立體視覺**估計前方路面縱向坡度 (pitch)** 的專案（樹莓派 5 + Waveshare IMX219-83 雙鏡頭）。對相機前方一段路面（距離窗 `config.z_min_m`~`z_max_m`，目前預設 7–20m）的點雲擬**一個平面**，算出它相對相機的縱向坡度——所以主結果是「前方那段路的平均坡度」，非腳下、也非外插預測；調 `z_min/z_max` 即改「量多遠的前方」（遠處視差小、噪點多，`z_max` 上限受此限制）。主結果是**純雙目幾何**（左右兩顆鏡頭一起算，靠 62mm 基線得到公尺尺度的深度）；IMU 只是**輔助**（把相機安裝俯角補回去，換成相對水平面的絕對坡度）。
 
-三種執行來源／呈現方式（見下）：離線影片、即時鏡頭純終端、即時鏡頭 + PyQt 視覺介面。沒有測試框架、沒有 lint，直接在 Pi 5 上跑。上層目錄（`../`）是產生 `calib.npz` 與錄影的相機/校正專案；本專案只**消費**它的 `calib.npz`，不修改它。
+四種執行來源／呈現方式（見下）：離線影片純終端 (`main.py`)、即時鏡頭純終端、即時鏡頭 + PyQt 視覺介面 (`main.py --live`)、**離線影片 + PyQt 視覺介面**（`run_video.py`：對錄好的影片圈 ROI、Enter 開始偵測、空白鍵切出想要的路段並輸出）。沒有測試框架、沒有 lint，直接在 Pi 5 上跑。上層目錄（`../`）是產生 `calib.npz` 與錄影的相機/校正專案；本專案只**消費**它的 `calib.npz`，不修改它。
 
 ## 執行（一律透過 `main.py`，它只轉呼叫 `src.cli`）
 
@@ -19,6 +19,10 @@ python3 main.py --live
 python3 main.py <segment資料夾>
 python3 main.py --cam0 a.mp4 --cam1 b.mp4        # 兩支 mp4 不在同一夾時
 python3 main.py <segment資料夾> --limit 20        # 只跑前 N 幀
+
+# 離線影片 + 視覺介面：對錄好的影片圈 ROI、Enter 開始偵測、空白鍵切出想要的路段
+python3 run_video.py cam0.mp4 cam1.mp4
+python3 run_video.py                             # 不給參數用 run_video.py 開頭寫死的預設路徑
 
 # 單獨檢查校正檔
 python3 -m src.calib_loader calib.npz
@@ -36,6 +40,16 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 - **UI 兩階段（Enter 閘門）**：`StereoWorker.active` 初始 False＝框選階段（只 rectify + 畫 ROI 框，**跳過 SGBM/擬合/錄影**，預覽更順好瞄準）；主執行緒 `keyPressEvent` 收到 Enter 設 `active=True` 才進預測階段（錄影器此時才**延後建立**，故框選過程不會產生空 segment）。**此閘門只在 UI**；headless `--live` 走 `pipeline.process_live`、不經本 worker，一律直接跑、無需 Enter。
 - 即時模式（不論有無 UI）都會經 `src/recorder.py` 把 cam0/cam1 錄到 **`output/segment_NNN/`**（遞增編號、**不覆蓋**），並輸出 `road_angle.csv`（含 `time_s`）+ `road_angle_trend.png`（matplotlib 趨勢圖）。
 - **段落每 `config.segment_seconds`（預設 60 秒）自動輪替**：`SessionRecorder.add()` 每幀檢查牆鐘時間，滿了就 `_finalize_segment()`（寫 CSV/趨勢圖、封 mp4）再開下一段 `segment_NNN`。好處是即時跑越久越不怕中途 `kill -9`/當機——CSV/PNG/mp4 都是段落結束才落地，輪替讓**最多只損失最後不到一段的資料**。用牆鐘計時（非幀數），故每段都是真的 N 秒、段內幀數隨當下 fps 變動；**每段 `time_s` 從 0 重新計**。設 `segment_seconds=0` 關閉輪替＝舊行為（只在 Ctrl+C 停止時一次寫出）。
+
+## 第四種模式：離線影片 + UI（`run_video.py`，跟即時 UI 刻意分開）
+
+這條路**不經 `main.py`/`src/cli.py`**，是獨立入口：`run_video.py` → `src/video_ui.py`。刻意**不共用** `src/ui.py`（即時），因為操作流程不同（多了「空白鍵切段」與「偵測疊圖影片」）；兩者只共用通用顯示元件（`ui.py` 的 `VideoLabel` 滑鼠拉框、`_draw_text` 疊字、`DISPLAY_SCALE`）。改 `ui.py` 前要知道 `video_ui.py` 有 import 這三個。
+
+- **來源是 `src/video_source.py:VideoStereo`**：把兩支 mp4 包成「介面跟 `LiveStereo` 一樣」的 context manager（`frames()` 吐 native 尺寸 BGR 幀對），串流解碼、不一次載入整支，開視窗不卡。用序號配對（第 i 幀對第 i 幀），非 `pairing.iter_pairs` 的時間戳配對（互動預覽夠用）。另有 `first_frame()` 只解第一幀。
+- **框選階段「定格」在影片第一幀**（`VideoWorker.run` 前半段）：`first_frame()` 取靜止底圖、Enter 前一直重畫同一張（影像不動好瞄準，拖曳中的黃框每次重畫都更新）。**按 Enter 才用 `VideoStereo(..., loop=True)` 從頭播放** + 偵測（`loop=True` 只用在偵測階段，讓短影片跑完自動回頭直到空白鍵）。注意與即時 `ui.py` 的差異：即時框選階段是鏡頭即時畫面在動，這裡是**定格**。
+- **ROI 中心距離讀數**：框選與偵測畫面左上都疊 `ROI center ~ X.X m`＝ROI 框中心的前向距離 Z（`_patch_depth_m` 取中心小區塊中位 Z）。框選階段對定格幀**整張算一次視差**（`stereo_from_rectified(..., roi=(0,0,pw,ph))`）供拖框時即時查；偵測階段取當幀 ROI 子區塊中心。用途：直接看出「ROI 框太遠」——若中心距離小於 `z_min_m`（例：路面在 3–6m 但 `z_min=7`），選點全被距離窗濾掉、每幀擬合失敗（畫面顯示紅色 `？？？？`）。
+- **操作流程**：圈 ROI（存 `roi.json`，跟即時共用同一個框）→ **Enter** 進偵測（`VideoWorker.active=True`，此時才建 `SessionRecorder` + `detect.mp4` writer）→ **空白鍵** `stop()` 收尾。切出的是「Enter 到空白鍵」這一段。
+- **輸出到 `output_videos/segment_NNN/`**（`run_video.py` 用 `dataclasses.replace(DEFAULT, segment_seconds=0.0, output_dir="output_videos")`：**不切段**故整段一個 segment、一張趨勢圖；另開資料夾跟即時錄影的 `output/` 分流）。每段比即時多一個 `detect.mp4`＝疊了綠色路面+坡度文字的偵測畫面（process 解析度 ×`DISPLAY_SCALE`）；`cam0/cam1.mp4` 是那段的原影片、`road_angle.csv`/`road_angle_trend.png` 同即時。
 
 ## Python 環境（非顯而易見，改動前必讀）
 
@@ -62,7 +76,8 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 - **`src/disparity.py`** — `StereoMatcher`(StereoSGBM) + `StereoResult`。`compute_stereo` 一步做完；`stereo_from_rectified` 讓 UI「整張只 rectify 一次」還能單獨對 ROI 算視差。
 - **`src/roadplane.py`** — 核心幾何（座標系/角度定義見下）。`plane_inlier_mask()` 產生「哪些像素在這片平面上」給 UI 塗綠。
 - **`src/pairing.py`** — 離線左右幀配對（時間戳/序號，見下）。
-- **`src/live.py`** — Picamera2 即時來源。`src/ui.py` — PyQt 視窗（背景 QThread 運算）。`src/recorder.py` — session 錄影+CSV+趨勢圖。`src/plot.py` — matplotlib 趨勢圖。`src/cli.py` — 分岔三模式 + 終端輸出。
+- **`src/live.py`** — Picamera2 即時來源。`src/ui.py` — 即時 PyQt 視窗（背景 QThread 運算）。`src/recorder.py` — session 錄影+CSV+趨勢圖。`src/plot.py` — matplotlib 趨勢圖。`src/cli.py` — 分岔 `main.py` 三模式 + 終端輸出。
+- **`src/video_source.py`** — 離線影片來源 `VideoStereo`（介面同 `LiveStereo`，循環播放）。**`src/video_ui.py`** — 影片專用 PyQt 視窗（`VideoWorker`/`VideoWindow`，Enter 開始/空白鍵切段+`detect.mp4`），由 `run_video.py` 啟動，跟 `ui.py` 分開（見「第四種模式」）。
 
 ## 加速：降解析度 + ROI（改動 disparity/calib 前必懂）
 
@@ -82,7 +97,7 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 ## 非顯而易見的限制
 
 - **`calib.npz` 單位是 mm**（`SQUARE_SIZE_MM` 用 mm、`T`≈62mm 基線）→ `reprojectImageTo3D` 出來也是 mm。`config.depth_scale=1000.0` 負責 mm→m；**動它會讓所有深度/角度全錯**。
-- **cam0=參考/左影像(`P1`)、cam1=右(`P2`, Tx 負)**。視差以 cam0 為基準；`Q` 還原成 cam0 校正座標系。UI 視窗顯示的底圖是 cam0 一張，但深度/角度是左右兩張一起算。
+- **cam0=參考/左影像(`P1`)、cam1=右(`P2`, Tx 負)**。視差以 cam0 為基準；`Q` 還原成 cam0 校正座標系。即時 UI (`ui.py`) 把 cam0(左)/cam1(右)兩顆校正後影像**並排顯示**（避免誤會只用單顆），但綠色路面內點只疊在左圖(cam0)——mask 是 cam0 像素座標，右圖同像素被視差平移、塗上去會錯位；右圖只畫黃色 ROI 框。滑鼠拉框設 ROI 只在左圖座標系生效。深度/角度是左右兩張一起算。（`video_ui.py` 離線 UI 也同樣並排顯示 cam0/cam1，並沿用 `ui.py` 的 `_as_bgr`/`_compose_lr`/`_panel_label`；`detect.mp4` 因此也是並排畫面。）
 - **RMS 小 ≠ 角度可信**：牆面也是一片乾淨平面（RMS 小、內點高，pitch 卻 ±80°）。光靠 RMS/內點分不出「路面 vs 牆」，要靠幾何合理性（法向量方向/相機高度/pitch 範圍）或穩定的拍攝 + ROI 框。相機沒固定好時逐幀會鎖到不同的面、角度暴衝，這**不是 bug**。
 - **左右幀配對兩種精度，`pairing.iter_pairs` 自動選**：有 `cam*_pts.txt`+`start_time.json` → 絕對時間戳配對（掉幀也對得回）；只有 mp4 → **序號配對**，一邊掉幀後會永遠錯開一幀而不報錯。pts 行序是編碼序需先排序、行數偶爾比可解碼幀多 1（`pairing.py` 已處理）。
 - **即時沒有硬體幀同步**：兩顆 Picamera2 各自 `capture_array()`，左右差幾 ms，車速快時視差略誤。錄影用的 `--sync` 在即時串流沒有等價做法。

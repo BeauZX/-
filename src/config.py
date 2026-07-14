@@ -30,7 +30,7 @@ class Config:
     # num_disparities 以「原生解析度」為準，實際會依 process_scale 自動縮放並取
     # 16 倍數。128(原生) → 最近可測約 0.74m (Z=f*baseline/disp)。
     num_disparities: int = 128
-    block_size: int = 5
+    block_size: int = 3
     uniqueness_ratio: int = 10
     speckle_window_size: int = 100
     speckle_range: int = 2
@@ -41,15 +41,15 @@ class Config:
     depth_scale: float = 1000.0
 
     # === 路面選點範圍（相機座標，公尺）===
-    z_min_m: float = 7  # 最近距離（量「前方」路面，跳過腳下近路）
-    z_max_m: float = 20.0  # 最遠距離（20m 內單點誤差 <~21%，擬平面後角度可靠）
+    z_min_m: float = 2.0  # 最近距離（近路面素材：ROI 中心量到 <7m，7 會把點全濾光）
+    z_max_m: float = 12.0  # 最遠距離（近路面延伸有限，收小避免遠端稀疏雜訊）
     y_min_m: float = -0.5  # 路面在相機下方(Y 向下為正)，排除天空/高處
     # 註：影像橫帶的限制已由 disparity_roi_fraction 在算視差前處理，這裡不再重複裁列。
 
     # === RANSAC 平面擬合 ===
     ransac_threshold_m: float = 0.05  # 內點垂直殘差門檻 (5cm)
-    ransac_iterations: int = 300
-    min_road_points: int = 200  # 路面點數下限，不足視為擬合失敗
+    ransac_iterations: int = 500
+    min_road_points: int = 150 # 路面點數下限，不足視為擬合失敗
     seed: int = 0
 
     # === 即時鏡頭 (--live，Picamera2) ===
