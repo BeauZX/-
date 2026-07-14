@@ -27,8 +27,11 @@ python3 run_video.py                             # 不給參數用 run_video.py 
 # 單獨檢查校正檔
 python3 -m src.calib_loader calib.npz
 
+# 雙目測距驗證（獨立工具，不在主管線內；框物件量距離比對捲尺，見「測距驗證工具」節）
+python3 tool/measure_distance.py
+
 # 語法檢查（唯一的自動化檢查手段，沒有 lint/test）
-python3 -m py_compile src/*.py main.py
+python3 -m py_compile src/*.py main.py tool/measure_distance.py
 ```
 
 CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quiet`。**所有演算法參數固定在 `src/config.py`**（`Config` dataclass + `DEFAULT`），要調就改那個檔、不從 CLI 傳（沿用上層 `calibrate_stereo.py` 的慣例）。`--record` 已移除：**即時模式一律錄影**（`config.record=True` 寫死）。
@@ -50,6 +53,17 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 - **ROI 中心距離讀數**：框選與偵測畫面左上都疊 `ROI center ~ X.X m`＝ROI 框中心的前向距離 Z（`_patch_depth_m` 取中心小區塊中位 Z）。框選階段對定格幀**整張算一次視差**（`stereo_from_rectified(..., roi=(0,0,pw,ph))`）供拖框時即時查；偵測階段取當幀 ROI 子區塊中心。用途：直接看出「ROI 框太遠」——若中心距離小於 `z_min_m`（例：路面在 3–6m 但 `z_min=7`），選點全被距離窗濾掉、每幀擬合失敗（畫面顯示紅色 `？？？？`）。
 - **操作流程**：圈 ROI（存 `roi.json`，跟即時共用同一個框）→ **Enter** 進偵測（`VideoWorker.active=True`，此時才建 `SessionRecorder` + `detect.mp4` writer）→ **空白鍵** `stop()` 收尾。切出的是「Enter 到空白鍵」這一段。
 - **輸出到 `output_videos/segment_NNN/`**（`run_video.py` 用 `dataclasses.replace(DEFAULT, segment_seconds=0.0, output_dir="output_videos")`：**不切段**故整段一個 segment、一張趨勢圖；另開資料夾跟即時錄影的 `output/` 分流）。每段比即時多一個 `detect.mp4`＝疊了綠色路面+坡度文字的偵測畫面（process 解析度 ×`DISPLAY_SCALE`）；`cam0/cam1.mp4` 是那段的原影片、`road_angle.csv`/`road_angle_trend.png` 同即時。
+
+## 測距驗證工具（`tool/measure_distance.py`，獨立於主管線）
+
+驗證雙目深度準不準的**獨立小工具**，跟主專案（估路面坡度）目的不同：框一個物件 → 雙目量它的距離 → 使用者拿捲尺量實際值比對誤差。**只消費 `src` 的 `calib_loader`/`disparity`/`live`/`video_source`，並沿用 `src/ui.py` 的 `_as_bgr`/`_compose_lr`/`_panel_label`**（`FitVideoLabel` 是它自己的滑鼠拉框元件，不共用 `ui.py` 的 `VideoLabel`，因為顯示縮放不同）。不改 `src`。
+
+- **量測公式與主管線完全相同**：一樣走 `disparity.py` 的 rectify → SGBM → `reprojectImageTo3D(Q)` → ÷`depth_scale`。差別只在「事後拿 3D 點做什麼」——這裡取 **ROI 內有效點的中位 Z** 當距離（非擬平面），以及 **`process_scale` 預設 1.0**（求準，主專案即時預設 0.5 求快）。要跟主專案等價比較就 `--scale 0.5`。
+- **入口自足**：`_ROOT = Path(__file__).parent.parent` 把專案根加進 `sys.path` 並鎖定 `calib.npz` 為 `_ROOT/calib.npz`——**不管從哪個 cwd 執行都找得到校正檔**（曾踩過在 `tool/` 裡跑找不到 `calib.npz` 的坑）。
+- **只能框左圖(cam0)**：測距以 cam0 為基準座標系，`self.roi[0] >= process_width` 即判定框在右圖(cam1)、提示 `Draw the box on the LEFT (cam0) image`；但深度是 cam0+cam1 兩張一起算（雙目本質），cam0 只是結果座標系，非「只用 cam0」。
+- **兩個防呆(改 worker 前要知道)**：(1) 顯示縮放 `disp_scale = min(2.0, MAX_DISPLAY_WIDTH/combo_w)`——全解析度並排若直接 ×2 會變 ~5128px 撐爆視窗（黑畫面），故縮到總寬 ≤1400；滑鼠座標同除此 scale。(2) 框寬 < `num_disparities+block_size` 時**跳過 SGBM**（否則 OpenCV 算出負寬度爆記憶體 OOM），提示 `ROI too narrow`。
+- **曝光旗標獨立於錄影**：`--shutter`/`--gain`（預設 30000/5.0，室內偏亮）用 `dataclasses.replace` 套進**副本 config**，不動 `src/config.py`，故**不影響 `main.py --live` 錄影的曝光**（那個仍讀 `config.py` 的 8000/1.0）。兩顆鏡頭吃同一組固定曝光（雙目亮度一致 SGBM 才配得準）。
+- **輸出**：按 `s` 用 `QWidget.grab()` 截整個視窗存 `check_dist/sample_NNN.png`（**遞增、不覆蓋、跨執行接續編號**：啟動時掃現有 `sample_*.png` 取 max+1）+ 追加一列到 `check_dist/distance_log.csv`（含中位距離、IQR、std、點數）。畫面綠字只顯示 `Distance` + `fps`（簡報乾淨），IQR/std/n 仍寫進 CSV 備查。`check_dist/` 已 gitignore。
 
 ## Python 環境（非顯而易見，改動前必讀）
 
