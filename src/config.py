@@ -77,12 +77,13 @@ class Config:
     use_imu: bool = False
     imu_filter_alpha: float = 0.96  # 互補濾波：陀螺儀(短期) + 加速度計(長期)，同上層
     imu_sample_hz: float = 100.0  # 背景執行緒取樣率（>幀率，確保每幀拿到夠新的值）
-    # 實測(腳踏車):抬車頭時原始 pitch 反而變小(+4→-1)，與「抬頭為正」慣例相反 → 翻正負。
-    imu_invert_pitch: bool = True  # 硬體安裝方向讓 pitch 正負相反時設 True（實測決定）
-    # IMU 軸↔相機光軸的固定偏移。校法：use_imu=True 且此值=0，對「已知平坦」地面跑
-    # 即時，記下穩定的 pitch_gravity 讀數 G，把這裡設成 -G，之後平地讀 0、下坡為負、
-    # 上坡為正。（相機一旦重新安裝／動到角度就要重校。）
-    imu_mount_pitch_offset_deg: float = 0.0
+    # 軸向已正名(見 imu.py)：縱向 pitch 用 atan2(ay,az)+gx。正負待抬頭低頭確認、先不翻。
+    imu_invert_pitch: bool = False  # 硬體安裝方向讓 pitch 正負相反時設 True（實測決定）
+    # 固定偏移——沿用上層 FIXED_ROLL_OFFSET 手法：靜置量一次、把這個基準扣掉。
+    # 實測(2026-07) `python3 -m src.imu` 靜置讀 -93.73° → 設 +93.73 讓靜置歸零。
+    # 註：這只是「IMU 靜置零」；相機朝下的安裝俯角，之後要「對平地跑 main.py --live、
+    # 把對水平讀數也歸零」才會一起補掉（那步算出的值會覆寫這裡）。
+    imu_mount_pitch_offset_deg: float = 90.0  # 安裝俯角補回（正值：相機朝下、水平面在相機前方）
 
     # === 錄影 / session 輸出（寫死一律開啟）===
     # 即時模式一律把 cam0/cam1 錄到 output/segment_NNN/（遞增編號、不覆蓋），

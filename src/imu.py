@@ -44,6 +44,7 @@ class ImuReader:
         self.available = False
         self._imu = None
         self._pitch: float | None = None  # 融合後的原始 pitch（未套 invert/offset）
+        self._yaw: float | None = None  # 融合後的 yaw（只供自測辨識軸向，管線不用）
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -99,17 +100,25 @@ class ImuReader:
             try:
                 ax, ay, az, gx, gy, gz = self._imu.read_accelerometer_gyro_data()
                 t = time.time()
-                # 加速度計→絕對 pitch（重力基準）；沿用上層公式 atan2(-ax, |a_yz|)。
-                pitch_acc = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
+                # ── 命名對應「車輛」的實際動作（實測 2026-07，晶片側貼）──
+                # 上層 rpi5_dual_camera_capture.py 用感測器本體座標命名，但這台側貼後
+                # 錯位：上層的 roll(atan2(ay,az)+gx) 實際是車輛「pitch 俯仰＝上下坡」，
+                # 上層的 pitch(atan2(-ax,..)+gy) 實際像車輛「yaw 偏擺」。故這裡直接以
+                # 車輛動作命名——pitch=上下坡(要用的)、yaw=偏擺(只供辨識，管線不用)。
+                pitch_acc = math.degrees(math.atan2(ay, az))  # 車輛俯仰（上下坡）
+                yaw_acc = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))  # 像偏擺
                 dt = (t - last_t) if last_t is not None else 0.0
                 last_t = t
                 if dt > 0:
-                    # 互補濾波：陀螺儀積分(短期) + 加速度計(長期)。gy = 繞 y 軸角速度。
-                    pitch = alpha * (pitch + gy * dt) + (1 - alpha) * pitch_acc
+                    # 互補濾波：陀螺儀積分(短期) + 加速度計(長期)。
+                    # pitch 配 gx（繞晶片 X 軸＝車輛俯仰）、yaw 配 gy（繞晶片 Y 軸＝垂直）。
+                    pitch = alpha * (pitch + gx * dt) + (1 - alpha) * pitch_acc
+                    yaw = alpha * (yaw + gy * dt) + (1 - alpha) * yaw_acc
                 else:
-                    pitch = pitch_acc
+                    pitch, yaw = pitch_acc, yaw_acc
                 with self._lock:
                     self._pitch = pitch
+                    self._yaw = yaw
             except Exception as e:
                 print(f"[imu] 讀取失敗：{e}", flush=True)
                 time.sleep(0.5)
@@ -130,16 +139,22 @@ def _selftest() -> None:
 
     from .config import DEFAULT
 
-    cfg = replace(DEFAULT, use_imu=True, imu_mount_pitch_offset_deg=0.0, imu_invert_pitch=False)
+    cfg = replace(DEFAULT, use_imu=True)  # 用真實 config（含剛校好的 offset/invert）驗證
     with ImuReader(cfg) as imu:
         if not imu.available:
             print("IMU 不可用，結束。")
             return
-        print("即時 pitch（Ctrl+C 結束）。把相機前緣抬高/壓低，觀察正負方向是否合理：")
+        print("即時 pitch（Ctrl+C 結束）。靜置應接近 0；抬車頭應為正、低頭為負：")
         try:
             while True:
-                p = imu.pitch_deg
-                print(f"\rpitch = {p:+7.2f}°   " if p is not None else "\rpitch = --   ", end="", flush=True)
+                with imu._lock:
+                    raw, yaw = imu._pitch, imu._yaw
+                cal = imu.pitch_deg
+                if raw is None:
+                    print("\r-- ", end="", flush=True)
+                else:
+                    print(f"\r原始={raw:+7.2f}°  校正後 pitch={cal:+7.2f}°  (yaw={yaw:+7.2f}°)   ",
+                          end="", flush=True)
                 time.sleep(0.1)
         except KeyboardInterrupt:
             print("\n結束。")
