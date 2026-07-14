@@ -113,9 +113,20 @@ class SessionRecorder:
 
     def _write_trend(self) -> None:
         idx = [r.index for r in self._results]
-        pit = [r.pitch_deg for r in self._results]
         rol = [r.roll_deg for r in self._results]
-        save_angle_trend(str(self.dir / "road_angle_trend.png"), idx, pit, rol)
+        # 有 IMU 輔助（任一幀算出相對水平坡度）就畫 slope(pitch_gravity)，扣掉安裝俯角，
+        # 綠線會落在真實坡度附近；否則退回純雙目 pitch（相對相機光軸、含安裝俯角）。
+        has_imu = any(r.pitch_gravity_deg is not None for r in self._results)
+        if has_imu:
+            pit = [r.pitch_gravity_deg for r in self._results]
+            title, label = "Road slope trend (gravity-referenced)", "slope (gravity-ref)"
+        else:
+            pit = [r.pitch_deg for r in self._results]
+            title, label = "Road pitch trend", "pitch (longitudinal)"
+        save_angle_trend(
+            str(self.dir / "road_angle_trend.png"), idx, pit, rol,
+            title=title, pitch_label=label,
+        )
 
 
 def _fmt(v: float | None, ndigits: int = 2) -> str:

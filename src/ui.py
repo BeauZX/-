@@ -242,6 +242,7 @@ def _draw_text(img, plane, fr: FrameResult, fps: float) -> None:
         cv2.putText(img, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
         cv2.putText(img, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
         y += 30
+    return y
 
 
 class VideoLabel(QLabel):

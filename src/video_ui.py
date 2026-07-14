@@ -11,13 +11,13 @@
          road_angle.csv          每幀角度
          road_angle_trend.png    坡度趨勢圖
 
-運算在背景 QThread。由 run_video.py 啟動。跟 ui.py 共用的只有通用的顯示元件
-（VideoLabel 滑鼠拉框、_draw_text 疊字），其餘完全獨立、不影響即時模式。
+運算在背景 QThread。由 run_video.py 啟動。跟 ui.py 共用的只有通用顯示元件
+（VideoLabel 滑鼠拉框、_as_bgr/_compose_lr/_panel_label 疊圖、DISPLAY_SCALE）；
+偵測畫面的文字改由本檔自己的 _draw_slope 畫（精簡版，跟即時 ui.py 的 _draw_text
+分開），其餘完全獨立、不影響即時模式。
 """
 
 from __future__ import annotations
-
-import time
 
 import cv2
 import numpy as np
@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 from .calib_loader import StereoCalibration
 from .config import Config
 from .disparity import StereoMatcher, stereo_from_rectified
+from .imu_track import ImuTrack
 from .pipeline import FrameResult
 from .recorder import SessionRecorder
 from .roadplane import fit_road_plane, plane_inlier_mask, select_road_points
@@ -37,10 +38,38 @@ from .ui import (  # 通用顯示元件，沿用不重造
     VideoLabel,
     _as_bgr,
     _compose_lr,
-    _draw_text,
     _panel_label,
 )
 from .video_source import VideoStereo
+
+
+def _draw_slope(img: np.ndarray, plane, fr: FrameResult) -> None:
+    """偵測畫面只留主結果 + 兩盞 sanity 燈，其餘（pitch/RMS/inliers/fps/imu/ROI 距離）
+    不上螢幕、全留在 road_angle.csv：
+
+        slope <大字>        前方路面相對水平面的坡度（雙目+IMU；無 IMU 退回純雙目 pitch）
+        h .. m   roll ..    相機估計高度 + 橫向坡度（確認擬到的是路面、不是牆）
+
+    文字顏色沿用可信度：RMS 小且內點比例高→綠、否則橘（隱含 RMS/內點，不再列數字）。
+    cv2 Hershey 畫不出中文：擬合失敗訊息會顯示為紅色 ??????（非當機，見 CLAUDE.md）。"""
+    if plane is None:
+        for w, col in ((5, (0, 0, 0)), (2, (0, 0, 255))):
+            cv2.putText(img, "路面擬合失敗", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, w)
+        return
+    ratio = fr.n_inliers / fr.n_road_points if fr.n_road_points else 0.0
+    good = plane.rms_m * 100 < 4.0 and ratio > 0.5
+    col = (0, 255, 0) if good else (0, 165, 255)
+    # 主結果：有 IMU → slope（相對水平）；沒有 → 退回純雙目 pitch（相機相對）
+    head = (
+        f"slope {fr.pitch_gravity_deg:+.1f}"
+        if fr.pitch_gravity_deg is not None
+        else f"pitch {fr.pitch_deg:+.1f}"
+    )
+    for w, c in ((6, (0, 0, 0)), (3, col)):  # 黑描邊 + 彩字，放大當標題
+        cv2.putText(img, head, (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 1.2, c, w)
+    sub = f"h {fr.cam_height_m:.2f}m   roll {fr.roll_deg:+.1f}"
+    for w, c in ((4, (0, 0, 0)), (2, col)):
+        cv2.putText(img, sub, (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, w)
 
 
 class VideoWorker(QThread):
@@ -93,10 +122,11 @@ class VideoWorker(QThread):
             return
 
         # === 偵測階段：從頭播放影片、逐幀算角度並錄影，直到按空白鍵 stop() ===
+        # IMU 輔助：影片旁有 imu_raw.csv 且 config.use_imu 開啟時，讀當初錄影記錄的
+        # 逐幀相機 pitch，補算相對水平面的真實坡度（pitch_gravity）。沒有就 None＝純雙目。
+        imu_track = ImuTrack.load(self.cam0, self.config) if self.config.use_imu else None
         recorder = None  # 進偵測才建，避免框選階段就開一個空 segment
         detect_vw = None  # 疊好圖的偵測影片 writer
-        t_prev = time.monotonic()
-        fps = 0.0
         i = 0
         try:
             with VideoStereo(self.cam0, self.cam1, size=self.calib.native_size, loop=True) as cams:
@@ -131,15 +161,11 @@ class VideoWorker(QThread):
                         if plane is None
                         else FrameResult.from_plane(i, plane, None)
                     )
+                    if imu_track is not None:  # 補算相對水平面的真實坡度（pitch_gravity）
+                        fr.with_imu(imu_track.pitch_for_frame(i))
                     recorder.add(img0, img1, fr)  # 原影片（native cam0/cam1）+ 累積角度
 
-                    now = time.monotonic()
-                    fps = 0.9 * fps + 0.1 * (1.0 / max(1e-6, now - t_prev))
-                    t_prev = now
-
-                    h_roi, w_roi = res.pts.shape[:2]  # ROI 框中心的前向距離（公尺）
-                    z_center = self._patch_depth_m(res, w_roi // 2, h_roi // 2)
-                    big = self._annotate(rect0, rect1, res, plane, fr, fps, z_center)  # 並排 BGR 畫面
+                    big = self._annotate(rect0, rect1, res, plane, fr)  # 並排 BGR 畫面
                     if detect_vw is None:  # 用實際並排畫面尺寸建 writer（左右並排比單圖寬）
                         detect_vw = cv2.VideoWriter(
                             str(recorder.dir / "detect.mp4"),
@@ -192,12 +218,10 @@ class VideoWorker(QThread):
             cv2.putText(big, text, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         return self._to_qimage(big)
 
-    def _annotate(
-        self, rect0, rect1, res, plane, fr: FrameResult, fps: float, z_center: float | None = None
-    ) -> np.ndarray:
-        """cam0(左)/cam1(右) 校正後並排 + 角度文字 + ROI 中心距離，回傳放大後的 BGR 畫面
-        （顯示與偵測影片共用）。綠色路面內點只疊在左圖(cam0)：mask 是 cam0 像素座標，右圖
-        同像素被視差平移、塗上去會錯位；黃色 ROI 框兩顆都畫。"""
+    def _annotate(self, rect0, rect1, res, plane, fr: FrameResult) -> np.ndarray:
+        """cam0(左)/cam1(右) 校正後並排 + 精簡角度文字，回傳放大後的 BGR 畫面（顯示與偵測
+        影片共用）。綠色路面內點只疊在左圖(cam0)：mask 是 cam0 像素座標，右圖同像素被視差
+        平移、塗上去會錯位；黃色 ROI 框兩顆都畫。"""
         left = _as_bgr(rect0)
         right = _as_bgr(rect1)
         x0, y0 = res.x0, res.y0
@@ -215,11 +239,7 @@ class VideoWorker(QThread):
             combo, (combo.shape[1] * DISPLAY_SCALE, combo.shape[0] * DISPLAY_SCALE),
             interpolation=cv2.INTER_NEAREST,
         )
-        _draw_text(big, plane, fr, fps)
-        # ROI 中心前向距離（判斷框太遠→辨識差）。畫在角度文字下方。
-        depth = f"ROI center ~ {z_center:.1f} m" if z_center is not None else "ROI center: no depth"
-        cv2.putText(big, depth, (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
-        cv2.putText(big, depth, (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        _draw_slope(big, plane, fr)
         return big
 
     @staticmethod

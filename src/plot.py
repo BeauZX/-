@@ -18,13 +18,18 @@ def save_angle_trend(
     pitches: list[float | None],
     rolls: list[float | None] | None = None,
     title: str = "Road pitch trend",
+    pitch_label: str = "pitch (longitudinal)",
 ) -> None:
-    """畫 pitch（與可選 roll）對 frame index 的折線圖，存到 path。"""
+    """畫 pitch（與可選 roll）對 frame index 的折線圖，存到 path。
+
+    pitch_label：主線的圖例名稱。有 IMU 輔助時呼叫端會傳 slope（相對水平面），
+    純雙目時維持 pitch（相對相機光軸）。
+    """
     fig, ax = plt.subplots(figsize=(10, 4.2), dpi=110)
 
     xp = [i for i, v in zip(indices, pitches) if v is not None]
     yp = [v for v in pitches if v is not None]
-    ax.plot(xp, yp, color="#1a8a1a", lw=1.6, label="pitch (longitudinal)")
+    ax.plot(xp, yp, color="#1a8a1a", lw=1.6, label=pitch_label)
 
     if rolls is not None:
         xr = [i for i, v in zip(indices, rolls) if v is not None]
@@ -34,7 +39,7 @@ def save_angle_trend(
     if yp:
         mean = sum(yp) / len(yp)
         ax.axhline(mean, color="#1a8a1a", ls="--", lw=0.8, alpha=0.5,
-                   label=f"pitch mean {mean:+.1f} deg")
+                   label=f"mean {mean:+.1f} deg")
 
     ax.axhline(0, color="#888", lw=0.8)
     ax.set_xlabel("frame")

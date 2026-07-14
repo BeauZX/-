@@ -63,8 +63,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # 影片模式的 config：不切段（segment_seconds=0，Enter→空白鍵整段當一個 segment、
-    # 一張趨勢圖）、輸出另開 output_videos/ 跟即時錄影分開。
-    config = dataclasses.replace(DEFAULT, segment_seconds=0.0, output_dir="output_videos")
+    # 一張趨勢圖）、輸出另開 output_videos/ 跟即時錄影分開；use_imu=True 讓 video_ui
+    # 去讀影片旁的 imu_raw.csv（若有）補算相對水平面坡度，沒有就自動退回純雙目。
+    config = dataclasses.replace(
+        DEFAULT, segment_seconds=0.0, output_dir="output_videos", use_imu=True
+    )
 
     from src.video_ui import run_video_ui  # 影片專用 UI（跟即時 ui.py 分開）
 
