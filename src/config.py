@@ -71,6 +71,19 @@ class Config:
     # False → 純終端機印數字（較快、可 headless）。CLI --ui / --no-ui 可覆寫。
     show_ui: bool = False
 
+    # === IMU 輔助（ICM20948，把相機安裝俯角補回、換成相對水平面的真實坡度）===
+    # 預設「關」：不開時整條管線＝純雙目主結果，行為跟沒有這功能時完全一致。
+    # 接好 IMU、用 `python3 -m src.imu` 驗證軸向、校好零點後再設 True。
+    use_imu: bool = False
+    imu_filter_alpha: float = 0.96  # 互補濾波：陀螺儀(短期) + 加速度計(長期)，同上層
+    imu_sample_hz: float = 100.0  # 背景執行緒取樣率（>幀率，確保每幀拿到夠新的值）
+    # 實測(腳踏車):抬車頭時原始 pitch 反而變小(+4→-1)，與「抬頭為正」慣例相反 → 翻正負。
+    imu_invert_pitch: bool = True  # 硬體安裝方向讓 pitch 正負相反時設 True（實測決定）
+    # IMU 軸↔相機光軸的固定偏移。校法：use_imu=True 且此值=0，對「已知平坦」地面跑
+    # 即時，記下穩定的 pitch_gravity 讀數 G，把這裡設成 -G，之後平地讀 0、下坡為負、
+    # 上坡為正。（相機一旦重新安裝／動到角度就要重校。）
+    imu_mount_pitch_offset_deg: float = 0.0
+
     # === 錄影 / session 輸出（寫死一律開啟）===
     # 即時模式一律把 cam0/cam1 錄到 output/segment_NNN/（遞增編號、不覆蓋），
     # 並輸出 road_angle.csv + road_angle_trend.png。

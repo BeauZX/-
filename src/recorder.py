@@ -24,6 +24,7 @@ from .plot import save_angle_trend
 _CSV_FIELDS = [
     "index", "time_s", "pitch_deg", "roll_deg", "cam_height_m",
     "n_inliers", "n_road_points", "rms_m",
+    "imu_pitch_deg", "pitch_gravity_deg",  # 只有 use_imu 開啟時才有值，否則空
 ]
 
 
@@ -106,6 +107,8 @@ class SessionRecorder:
                     "n_inliers": r.n_inliers,
                     "n_road_points": r.n_road_points,
                     "rms_m": _fmt(r.rms_m, 4),
+                    "imu_pitch_deg": _fmt(r.imu_pitch_deg),
+                    "pitch_gravity_deg": _fmt(r.pitch_gravity_deg),
                 })
 
     def _write_trend(self) -> None:

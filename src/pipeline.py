@@ -34,10 +34,23 @@ class FrameResult:
     n_road_points: int
     rms_m: float | None
     time_diff_ms: float | None  # 左右幀時間差（配對品質指標）
+    # IMU 輔助（只有 use_imu 開啟時才有值，否則維持 None＝純雙目行為不變）：
+    imu_pitch_deg: float | None = None  # 相機自身相對水平的 pitch（IMU 讀）
+    pitch_gravity_deg: float | None = None  # 路面相對「水平面」的真實坡度＝相機相對 + IMU
 
     @classmethod
     def failed(cls, index: int, n_pts: int, time_diff_ms: float | None) -> "FrameResult":
         return cls(index, None, None, None, 0, n_pts, None, time_diff_ms)
+
+    def with_imu(self, imu_pitch_deg: float | None) -> "FrameResult":
+        """套上 IMU 相機 pitch，補算相對水平面的真實坡度（就地修改並回傳自己）。
+
+        imu_pitch_deg 為 None（IMU 不可用/關閉）或本幀擬合失敗時，兩個欄位維持 None。
+        """
+        self.imu_pitch_deg = imu_pitch_deg
+        if imu_pitch_deg is not None and self.pitch_deg is not None:
+            self.pitch_gravity_deg = self.pitch_deg + imu_pitch_deg
+        return self
 
     @classmethod
     def from_plane(
@@ -129,12 +142,15 @@ def process_live(
     max_frames: int | None = None,
     recorder=None,
     roi: tuple[int, int, int, int] | None = None,
+    imu=None,
 ) -> Iterator[FrameResult]:
     """接兩顆即時鏡頭，逐幀產生路面坡度結果，直到 Ctrl+C 或達到 max_frames。
 
     recorder（SessionRecorder，可選）非 None 時，每幀把原生 cam0/cam1 錄下來。
     roi（process 座標，可選）非 None 時只在框內算視差——headless 用它套用 UI 記住
     的 roi.json，跟 UI 模式吃同一個框。
+    imu（ImuReader，可選）非 None 時，每幀取最新相機 pitch 補算相對水平面的真實坡度
+    （pitch_gravity_deg）；None＝不做 IMU 修正，只有純雙目相機相對坡度。
     """
     from .live import LiveStereo  # 延後 import：只有即時模式才需要 picamera2
 
@@ -145,6 +161,8 @@ def process_live(
         i = 0
         for img0, img1 in cams.frames():
             fr = estimate_pair(calib, matcher, config, rng, i, img0, img1, None, roi)
+            if imu is not None:
+                fr.with_imu(imu.pitch_deg)
             if recorder is not None:
                 recorder.add(img0, img1, fr)
             yield fr

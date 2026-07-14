@@ -34,6 +34,8 @@ _CSV_FIELDS = [
     "n_road_points",
     "rms_m",
     "time_diff_ms",
+    "imu_pitch_deg",
+    "pitch_gravity_deg",
 ]
 
 
@@ -74,6 +76,8 @@ def _row(r: FrameResult) -> dict:
         "n_road_points": r.n_road_points,
         "rms_m": _fmt(r.rms_m, 4),
         "time_diff_ms": _fmt(r.time_diff_ms, 2),
+        "imu_pitch_deg": _fmt(r.imu_pitch_deg),
+        "pitch_gravity_deg": _fmt(r.pitch_gravity_deg),
     }
 
 
@@ -87,6 +91,7 @@ def _consume(
 ) -> list[float]:
     """走訪結果：寫 CSV(可選)、逐幀印出、回傳成功的 pitch 列表。"""
     pitches: list[float] = []
+    grav_pitches: list[float] = []
     n_ok = n_fail = 0
     t0 = time.monotonic()
     for r in results:
@@ -100,9 +105,15 @@ def _consume(
         else:
             n_ok += 1
             pitches.append(r.pitch_deg)
+            if r.pitch_gravity_deg is not None:
+                grav_pitches.append(r.pitch_gravity_deg)
+            grav = (
+                f" | 對水平={r.pitch_gravity_deg:+6.2f}°(IMU {r.imu_pitch_deg:+.1f}°)"
+                if r.pitch_gravity_deg is not None else ""
+            )
             status = (
                 f"pitch={r.pitch_deg:+6.2f}° roll={r.roll_deg:+5.2f}° "
-                f"h={r.cam_height_m:.2f}m inl={r.n_inliers}"
+                f"h={r.cam_height_m:.2f}m inl={r.n_inliers}{grav}"
             )
         if not quiet:
             fps = ""
@@ -111,6 +122,12 @@ def _consume(
                 fps = f" [{(r.index + 1) / el:4.1f}fps]" if el > 0 else ""
             print(f"frame {r.index:5d}{fps}  {status}")
     print(f"\n完成：{n_ok} 幀成功、{n_fail} 幀失敗")
+    if grav_pitches:
+        print(
+            f"坡度(相對水平面, IMU 修正) 中位={statistics.median(grav_pitches):+.2f}° "
+            f"平均={statistics.fmean(grav_pitches):+.2f}° "
+            f"（下坡為負、上坡為正；平地應接近 0，未歸零就是 imu_mount_pitch_offset_deg 待校）"
+        )
     return pitches
 
 
@@ -183,23 +200,26 @@ def _run_live(calib, args, *, record: bool = False) -> int:
     roi = load_roi(DEFAULT.roi_path, calib.process_size)
     if roi is not None:
         print(f"套用記住的 ROI {roi}（來自 {DEFAULT.roi_path}；UI 拉框設定/雙擊清除）")
-    results = process_live(
-        calib, config=DEFAULT, max_frames=args.limit, recorder=recorder, roi=roi
-    )
-    writer_ctx = _open_csv(Path(args.out)) if args.out else _null_csv()
+    from .imu import ImuReader  # IMU 輔助（config.use_imu 關閉時 available=False，不影響）
+
     pitches: list[float] = []
-    try:
-        with writer_ctx as (f, writer):
-            pitches = _consume(
-                results, writer=writer, quiet=args.quiet, limit=None, show_fps=True
-            )
-    except KeyboardInterrupt:
-        print("\n已停止 (Ctrl+C)。")
-    finally:
-        if recorder is not None:
-            recorder.close()
-            n = len(recorder.segments)
-            print(f"已存 {n} 段 → {DEFAULT.output_dir}/（每段含 cam0/cam1.mp4, road_angle.csv, road_angle_trend.png）")
+    with ImuReader(DEFAULT) as imu:
+        results = process_live(
+            calib, config=DEFAULT, max_frames=args.limit, recorder=recorder, roi=roi, imu=imu
+        )
+        writer_ctx = _open_csv(Path(args.out)) if args.out else _null_csv()
+        try:
+            with writer_ctx as (f, writer):
+                pitches = _consume(
+                    results, writer=writer, quiet=args.quiet, limit=None, show_fps=True
+                )
+        except KeyboardInterrupt:
+            print("\n已停止 (Ctrl+C)。")
+        finally:
+            if recorder is not None:
+                recorder.close()
+                n = len(recorder.segments)
+                print(f"已存 {n} 段 → {DEFAULT.output_dir}/（每段含 cam0/cam1.mp4, road_angle.csv, road_angle_trend.png）")
     if args.out:
         print(f"CSV → {args.out}")
     _print_summary(pitches)
