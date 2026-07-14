@@ -9,5 +9,7 @@ wheels/
 *output
 # UI 記住的 ROI（執行時產生、跟相機安裝位置綁定，非版控內容）
 roi.json
+# 測距驗證工具的樣本記錄（截圖 + CSV，執行時產生）
+check_dist/
 # Virtual environments
 .venv
