@@ -12,13 +12,15 @@
 不改 src。
 
 執行（在 Road_angle/ 底下）：
-    python3 tool/measure_distance.py                     # 即時雙目鏡頭（預設）
+    python3 tool/measure_distance.py                     # 即時雙目鏡頭（預設，戶外白天曝光）
+    python3 tool/measure_distance.py --shutter 30000 --gain 5.0  # 室內昏暗：曝光調大免太黑
     python3 tool/measure_distance.py --cam0 a.mp4 --cam1 b.mp4   # 用錄好的兩支影片
     python3 tool/measure_distance.py --expected 3.5      # 先給實際距離(公尺)，開窗就顯示誤差
     python3 tool/measure_distance.py --scale 0.5         # 降解析度換速度(預設 1.0 求準)
 
-註：驗證深度時預設用 process_scale=1.0（全解析度算視差，深度誤差最小）；覺得太慢再用
---scale 調小。近距離物件量不到時，物件可能比最近可測距離還近（見 num_disparities）。
+註：曝光預設戶外白天 2000µs/1.0（對齊上層 rpi5_dual_camera_capture.py），室內昏暗要
+--shutter/--gain 調大。驗證深度時預設用 process_scale=1.0（全解析度算視差，深度誤差最小）；
+覺得太慢再用 --scale 調小。近距離物件量不到時，物件可能比最近可測距離還近（見 num_disparities）。
 """
 
 from __future__ import annotations
@@ -79,13 +81,15 @@ class MeasureWorker(QThread):
     frameReady = pyqtSignal(QImage, object)  # (畫面, Measurement 或 None)
 
     def __init__(self, calib: StereoCalibration, config: Config, source: str,
-                 cam0: str | None, cam1: str | None) -> None:
+                 cam0: str | None, cam1: str | None,
+                 expected: float | None = None) -> None:
         super().__init__()
         self.calib = calib
         self.config = config
         self.source = source  # "live" 或 "video"
         self.cam0 = cam0
         self.cam1 = cam1
+        self.expected = expected  # 實際距離(公尺)，畫面顯示誤差用；None＝只顯示距離
         self._running = True
         self.roi: tuple[int, int, int, int] | None = None  # process 座標，主執行緒設定
         # 顯示縮放：讓「並排總寬」不超過 MAX_DISPLAY_WIDTH（全解析度也不會撐爆視窗）；
@@ -178,24 +182,28 @@ class MeasureWorker(QThread):
             combo, (int(round(combo.shape[1] * s)), int(round(combo.shape[0] * s))),
             interpolation=cv2.INTER_NEAREST if s >= 1.0 else cv2.INTER_AREA,
         )
-        self._overlay(big, meas, fps, note)
+        self._overlay(big, meas, fps, note, self.expected)
         rgb = cv2.cvtColor(big, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
 
     @staticmethod
     def _overlay(img: np.ndarray, meas: Measurement | None, fps: float,
-                 note: str | None = None) -> None:
-        # 畫面只顯示「距離」+「fps」，簡報乾淨好解釋；IQR/std/n 仍寫進 CSV 備查。
+                 note: str | None = None, expected: float | None = None) -> None:
+        # 畫面顯示「距離」+「fps」(+ 給了 --expected 就多一行誤差)；IQR/std/n 仍寫進 CSV 備查。
         if note is not None:  # 例如框太窄
             lines = [(note, (0, 165, 255), 0.7)]
         elif meas is None:
             lines = [("Drag a box on the object to measure", (0, 255, 255), 0.7)]
         else:
-            lines = [
-                (f"Distance: {meas.median:.3f} m", (0, 255, 0), 1.0),
-                (f"fps {fps:.1f}", (0, 255, 0), 0.7),
-            ]
+            lines = [(f"Distance: {meas.median:.3f} m", (0, 255, 0), 1.0)]
+            if expected is not None:  # 誤差 = 量測 − 實際；黃字強調這是比對結果
+                err = meas.median - expected
+                pct = 100.0 * err / expected if expected else 0.0
+                lines.append(
+                    (f"exp {expected:.3f} m  err {err:+.3f} m ({pct:+.1f}%)", (0, 255, 255), 0.7)
+                )
+            lines.append((f"fps {fps:.1f}", (0, 255, 0), 0.7))
         y = 34
         for text, col, scale in lines:
             cv2.putText(img, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 5)
@@ -248,10 +256,12 @@ class FitVideoLabel(QLabel):
 
 class MainWindow(QWidget):
     def __init__(self, calib: StereoCalibration, config: Config, source: str,
-                 cam0: str | None, cam1: str | None, outdir: str) -> None:
+                 cam0: str | None, cam1: str | None, outdir: str,
+                 expected: float | None = None) -> None:
         super().__init__()
         self.calib = calib
         self.config = config
+        self.expected = expected  # 實際距離(公尺)，用來算誤差；None＝只顯示距離
         self.outdir = Path(outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.outdir / "distance_log.csv"
@@ -265,7 +275,7 @@ class MainWindow(QWidget):
         self.setWindowTitle("雙目測距驗證")
         self.setFocusPolicy(Qt.StrongFocus)
 
-        self.worker = MeasureWorker(calib, config, source, cam0, cam1)
+        self.worker = MeasureWorker(calib, config, source, cam0, cam1, expected)
         self.video = FitVideoLabel(self.worker.disp_scale)
 
         self.save_btn = QPushButton("存這筆 (s)")
@@ -314,12 +324,17 @@ class MainWindow(QWidget):
             if new_file:
                 w.writerow([
                     "index", "image", "timestamp", "measured_m",
+                    "expected_m", "error_m", "error_pct",
                     "iqr_m", "std_m", "n_points", "roi",
                 ])
+            exp = self.expected
+            err = f"{meas.median - exp:.4f}" if exp is not None else ""
+            pct = f"{100.0 * (meas.median - exp) / exp:.2f}" if exp else ""
             w.writerow([
                 idx, img_name,
                 datetime.now().isoformat(timespec="seconds"),
                 f"{meas.median:.4f}",
+                "" if exp is None else f"{exp:.4f}", err, pct,
                 f"{meas.p75 - meas.p25:.4f}", f"{meas.std:.4f}", meas.count,
                 "" if self.worker.roi is None else "|".join(str(v) for v in self.worker.roi),
             ])
@@ -350,12 +365,15 @@ def main() -> int:
                     help="process_scale（預設 1.0 求準；調小換速度）")
     ap.add_argument("--outdir", default=str(_ROOT / "check_dist"),
                     help="截圖 + CSV 的輸出資料夾（預設專案根目錄的 check_dist/）")
-    # 預設用室內偏亮的固定曝光；兩顆鏡頭吃「同一組」才能保證雙目亮度一致(SGBM 匹配需要)。
-    # 太亮/太暗再用旗標覆寫。
-    ap.add_argument("--shutter", type=int, default=30000,
-                    help="即時鏡頭固定快門(µs)，兩顆共用。太黑調大、太亮調小(戶外可回 8000)")
-    ap.add_argument("--gain", type=float, default=5.0,
-                    help="即時鏡頭固定類比增益，兩顆共用。太黑調大(如 8.0)、太亮調小(如 2.0)")
+    # 預設用「戶外白天」固定曝光，對齊上層 rpi5_dual_camera_capture.py 的 SHUTTER_US=2000/
+    # GAIN=1.0（實測 Lux≈17000 戶外亮光下，自動曝光也收斂到 ≈2022µs/1.0）。兩顆鏡頭吃
+    # 「同一組」才能保證雙目亮度一致(SGBM 匹配需要)。室內昏暗會太黑→調大(如 30000/5.0)。
+    ap.add_argument("--shutter", type=int, default=2000,
+                    help="即時鏡頭固定快門(µs)，兩顆共用。戶外白天 2000；室內昏暗調大(如 30000)")
+    ap.add_argument("--gain", type=float, default=1.0,
+                    help="即時鏡頭固定類比增益，兩顆共用。戶外 1.0；室內昏暗調大(如 5.0)")
+    ap.add_argument("--expected", type=float, default=None,
+                    help="實際距離(公尺，捲尺量的)；給了就在畫面與 CSV 顯示量測誤差")
     args = ap.parse_args()
 
     if bool(args.cam0) != bool(args.cam1):
@@ -371,7 +389,7 @@ def main() -> int:
           f"  baseline={calib.baseline_mm:.1f}mm")
 
     app = QApplication.instance() or QApplication(sys.argv)
-    win = MainWindow(calib, config, source, args.cam0, args.cam1, args.outdir)
+    win = MainWindow(calib, config, source, args.cam0, args.cam1, args.outdir, args.expected)
     win.show()
     return app.exec_()
 

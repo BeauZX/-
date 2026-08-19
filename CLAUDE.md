@@ -67,7 +67,7 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 - **入口自足**：`_ROOT = Path(__file__).parent.parent` 把專案根加進 `sys.path` 並鎖定 `calib.npz` 為 `_ROOT/calib.npz`——**不管從哪個 cwd 執行都找得到校正檔**（曾踩過在 `tool/` 裡跑找不到 `calib.npz` 的坑）。
 - **只能框左圖(cam0)**：測距以 cam0 為基準座標系，`self.roi[0] >= process_width` 即判定框在右圖(cam1)、提示 `Draw the box on the LEFT (cam0) image`；但深度是 cam0+cam1 兩張一起算（雙目本質），cam0 只是結果座標系，非「只用 cam0」。
 - **兩個防呆(改 worker 前要知道)**：(1) 顯示縮放 `disp_scale = min(2.0, MAX_DISPLAY_WIDTH/combo_w)`——全解析度並排若直接 ×2 會變 ~5128px 撐爆視窗（黑畫面），故縮到總寬 ≤1400；滑鼠座標同除此 scale。(2) 框寬 < `num_disparities+block_size` 時**跳過 SGBM**（否則 OpenCV 算出負寬度爆記憶體 OOM），提示 `ROI too narrow`。
-- **曝光旗標獨立於錄影**：`--shutter`/`--gain`（預設 30000/5.0，室內偏亮）用 `dataclasses.replace` 套進**副本 config**，不動 `src/config.py`，故**不影響 `main.py --live` 錄影的曝光**（那個仍讀 `config.py` 的 8000/1.0）。兩顆鏡頭吃同一組固定曝光（雙目亮度一致 SGBM 才配得準）。
+- **曝光旗標獨立於錄影**：`--shutter`/`--gain`（預設 2000/1.0，戶外白天，對齊上層 `rpi5_dual_camera_capture.py`；室內昏暗要調大如 30000/5.0）用 `dataclasses.replace` 套進**副本 config**，不動 `src/config.py`，故改它**不影響 `main.py --live` 的曝光**（那個獨立讀 `config.py`）。兩顆鏡頭吃同一組固定曝光（雙目亮度一致 SGBM 才配得準）。
 - **輸出**：按 `s` 用 `QWidget.grab()` 截整個視窗存 `check_dist/sample_NNN.png`（**遞增、不覆蓋、跨執行接續編號**：啟動時掃現有 `sample_*.png` 取 max+1）+ 追加一列到 `check_dist/distance_log.csv`（含中位距離、IQR、std、點數）。畫面綠字只顯示 `Distance` + `fps`（簡報乾淨），IQR/std/n 仍寫進 CSV 備查。`check_dist/` 已 gitignore。
 
 ## Python 環境（非顯而易見，改動前必讀）
@@ -121,7 +121,7 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 - **RMS 小 ≠ 角度可信**：牆面也是一片乾淨平面（RMS 小、內點高，pitch 卻 ±80°）。光靠 RMS/內點分不出「路面 vs 牆」，要靠幾何合理性（法向量方向/相機高度/pitch 範圍）或穩定的拍攝 + ROI 框。相機沒固定好時逐幀會鎖到不同的面、角度暴衝，這**不是 bug**。
 - **左右幀配對兩種精度，`pairing.iter_pairs` 自動選**：有 `cam*_pts.txt`+`start_time.json` → 絕對時間戳配對（掉幀也對得回）；只有 mp4 → **序號配對**，一邊掉幀後會永遠錯開一幀而不報錯。pts 行序是編碼序需先排序、行數偶爾比可解碼幀多 1（`pairing.py` 已處理）。
 - **即時沒有硬體幀同步**：兩顆 Picamera2 各自 `capture_array()`，左右差幾 ms，車速快時視差略誤。錄影用的 `--sync` 在即時串流沒有等價做法。
-- **`live.py` 的解析度強制 = `calib.native_size`**；`config.live_shutter_us/live_gain` 固定曝光、AWB auto（雙目亮度一致）。Picamera2 index 0=i2c@88000=cam0(左)、1=i2c@80000=cam1(右)。
+- **`live.py` 的解析度強制 = `calib.native_size`**；`config.live_shutter_us/live_gain` 固定曝光、AWB auto（雙目亮度一致）。**預設 2000µs/1.0＝戶外白天**（對齊上層 `rpi5_dual_camera_capture.py`）；**室內昏暗會太黑，要把 `live_shutter_us`/`live_gain` 調大**（如 20000/4.0）。Picamera2 index 0=i2c@88000=cam0(左)、1=i2c@80000=cam1(右)。
 - **錄影名義 fps 固定 `record_fps`（實際變動）**，播放速度近似；要精準時間看 CSV 的 `time_s` 欄。
 - **UI 疊字用 `cv2.putText` 的 Hershey 字型，畫不出中文**：即時 `ui.py:_draw_text` 與離線 `video_ui.py:_draw_slope` 的失敗訊息「路面擬合失敗」在畫面上都會變成一串紅色 `??????`（每個中文字一個 `?`）。這**不是當機**，就是「這一幀沒擬出平面」的指示（多半因場景裡沒有點落在 `z_min~z_max`，例如室內近物配 `z_min=5m`）。要讓它可讀就把訊息改英文，或換能畫中文的繪字方式。
 
@@ -136,6 +136,7 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 | 想量更遠的前方又要精度 | `process_scale` 調回 1.0（全解析度算視差） | 深度誤差約減半、可拉大 `z_max_m`，代價是慢很多 |
 | 最近的路面沒被測到 | `num_disparities` 調大（16 倍數） | 換來更慢 |
 | 即時左右亮度不一致 | `live_shutter_us`/`live_gain` 固定曝光；AWB 維持 auto | 勿改固定色溫 |
+| 即時畫面過曝(戶外)/太黑(室內) | `live_shutter_us`/`live_gain`（預設 2000/1.0＝戶外白天） | 室內昏暗調大(如 20000/4.0)；測距工具用 `--shutter/--gain` 覆寫 |
 | 角度暴衝（±80° 亂跳） | **不是調參問題**：相機沒固定/沒對著路面，見「非顯而易見的限制」的 RMS 說明 | 固定相機 + 拉 ROI 框住路面 |
 
 ## IMU 輔助（把「相對相機光軸」換成「相對水平面」的真實坡度）

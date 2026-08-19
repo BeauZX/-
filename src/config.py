@@ -54,10 +54,11 @@ class Config:
 
     # === 即時鏡頭 (--live，Picamera2) ===
     # 兩顆鏡頭吃「同一組固定曝光」才能保證雙目亮度一致（AWB 維持 auto）。
-    # 建議跟 rpi5_dual_camera_capture.py 錄影時的 SHUTTER_US/GAIN 一致。
+    # 對齊 rpi5_dual_camera_capture.py 錄影時的 SHUTTER_US=2000/GAIN=1.0（戶外白天亮光；
+    # 實測 Lux≈17000 下自動曝光也收斂到 ≈2022µs/1.0）。室內昏暗會太黑→調大(如 20000/4.0)。
     # 解析度不在這裡：即時強制用 calib.image_size（校正綁定的解析度）。
-    live_shutter_us: int = 8000  # 固定快門 (µs)
-    live_gain: float = 1.0  # 固定類比增益
+    live_shutter_us: int = 2000  # 固定快門 (µs)，戶外白天
+    live_gain: float = 1.0  # 固定類比增益，戶外光線充足
     live_cam0_index: int = 0  # Picamera2 index：0 = i2c@88000 = cam0(左)
     live_cam1_index: int = 1  # 1 = i2c@80000 = cam1(右)
 
