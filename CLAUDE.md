@@ -44,24 +44,27 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 - `--live` 決定**來源**：有 → Picamera2 即時鏡頭 (`src/live.py`)；無 → 讀影片 (`src/pairing.py`)。
 - `--ui` 決定**呈現**：有 → PyQt 視窗 (`src/ui.py`)；無 → 終端機 + CSV。預設看 `config.show_ui`。
 - **UI 兩階段（Enter 閘門）**：`StereoWorker.active` 初始 False＝框選階段（只 rectify + 畫 ROI 框，**跳過 SGBM/擬合/錄影**，預覽更順好瞄準）；主執行緒 `keyPressEvent` 收到 Enter 設 `active=True` 才進預測階段（錄影器此時才**延後建立**，故框選過程不會產生空 segment）。**此閘門只在 UI**；headless `--live` 走 `pipeline.process_live`、不經本 worker，一律直接跑、無需 Enter。
-- 即時模式（不論有無 UI）都會經 `src/recorder.py` 把 cam0/cam1 錄到 **`output/segment_NNN/`**（遞增編號、**不覆蓋**），並輸出 `road_angle.csv`（含 `time_s`）+ `road_angle_trend.png`（matplotlib 趨勢圖）。
+- 即時模式（不論有無 UI）都會經 `src/recorder.py` 把 cam0/cam1 錄到 **`live_video_output/segment_NNN/`**（`config.output_dir`；遞增編號、**不覆蓋**），並輸出 `road_angle.csv`（含 `time_s`）+ `road_angle_trend.png`（matplotlib 趨勢圖）。舊資料在 `output/`（改名前的路徑）。
+- **`detect.mp4`（偵測疊圖影片）由 `SessionRecorder` 統一寫，三種即時/離線模式都有**：`add(img0, img1, fr, overlay=)` 傳入「畫面上看到的那張疊圖」就寫進當前 segment 的 `detect.mp4`（writer 第一幀才建、尺寸取自 overlay，因為並排放大後跟 native 不同；**切段時跟著換段重建**，故每個 `segment_NNN` 都有自己完整的一支）。用 `config.record_detect`（預設 True）總開關。
+- **疊圖本身在 `src/overlay.py`（純 cv2、不含 Qt）**：`annotate_frame()` 畫並排+綠色內點+坡度文字，回傳 BGR。**刻意不放在 `ui.py`**——`ui.py` 整個模組 import PyQt5，headless 只為了畫張圖去載 Qt 不合理。三個呼叫端：`ui.py`(即時 UI，畫面與 detect.mp4 共用同一張、只畫一次，要給 Qt 時才 `_to_qimage`)、`pipeline.process_live(annotate=True)`(headless)、`video_ui.py`(離線，只共用底層 `as_bgr`/`compose_lr`/`panel_label`，文字仍用自己精簡版的 `_draw_slope`)。`tool/measure_distance.py` 也從這裡拿顯示元件。
+- **headless 純 `--live` 加疊圖是有代價的**：它本來的優勢就是不畫圖，`annotate=True` 後每幀多一次 resize+putText+mp4 編碼，**fps 會掉**。`cli._run_live` 依 `config.record_detect` 決定傳不傳；只要看數字/求最快就把它設 False。`process_live` 也因此改成自己 `rectify` + `stereo_from_rectified` 兩步（成本等同原本的 `compute_stereo`，但疊圖需要校正影像），並用 `pipeline.estimate_with_plane()` 拿回 `RoadPlane`（畫綠色內點要用）。
 - **段落每 `config.segment_seconds`（預設 60 秒）自動輪替**：`SessionRecorder.add()` 每幀檢查牆鐘時間，滿了就 `_finalize_segment()`（寫 CSV/趨勢圖、封 mp4）再開下一段 `segment_NNN`。好處是即時跑越久越不怕中途 `kill -9`/當機——CSV/PNG/mp4 都是段落結束才落地，輪替讓**最多只損失最後不到一段的資料**。用牆鐘計時（非幀數），故每段都是真的 N 秒、段內幀數隨當下 fps 變動；**每段 `time_s` 從 0 重新計**。設 `segment_seconds=0` 關閉輪替＝舊行為（只在 Ctrl+C 停止時一次寫出）。
 
 ## 第四種模式：離線影片 + UI（`run_video.py`，跟即時 UI 刻意分開）
 
-這條路**不經 `main.py`/`src/cli.py`**，是獨立入口：`run_video.py` → `src/video_ui.py`。刻意**不共用** `src/ui.py`（即時），因為操作流程不同（多了「空白鍵切段」與「偵測疊圖影片」）；兩者只共用通用顯示元件（`ui.py` 的 `VideoLabel` 滑鼠拉框、`_as_bgr`/`_compose_lr`/`_panel_label` 疊圖、`DISPLAY_SCALE`）。**偵測畫面的文字是 `video_ui.py` 自己的 `_draw_slope`（精簡版），不用 `ui.py:_draw_text`**——改 `ui.py` 那幾個共用元件前要知道 `video_ui.py` 有 import。
+這條路**不經 `main.py`/`src/cli.py`**，是獨立入口：`run_video.py` → `src/video_ui.py`。刻意**不共用** `src/ui.py`（即時），因為操作流程不同（多了「空白鍵切段」與「偵測疊圖影片」）；兩者只共用 `ui.py` 的 `VideoLabel`（滑鼠拉框的 Qt 元件）＋ `overlay.py` 的通用疊圖元件（`as_bgr`/`compose_lr`/`panel_label`/`patch_depth_m`/`DISPLAY_SCALE`）。**偵測畫面的文字是 `video_ui.py` 自己的 `_draw_slope`（精簡版），不用 `overlay.py:draw_text`**——改 `overlay.py` 前要知道三個呼叫端都有 import。
 
 - **來源是 `src/video_source.py:VideoStereo`**：把兩支 mp4 包成「介面跟 `LiveStereo` 一樣」的 context manager（`frames()` 吐 native 尺寸 BGR 幀對），串流解碼、不一次載入整支，開視窗不卡。用序號配對（第 i 幀對第 i 幀），非 `pairing.iter_pairs` 的時間戳配對（互動預覽夠用）。另有 `first_frame()` 只解第一幀。
 - **框選階段「定格」在影片第一幀**（`VideoWorker.run` 前半段）：`first_frame()` 取靜止底圖、Enter 前一直重畫同一張（影像不動好瞄準，拖曳中的黃框每次重畫都更新）。**按 Enter 才用 `VideoStereo(..., loop=True)` 從頭播放** + 偵測（`loop=True` 只用在偵測階段，讓短影片跑完自動回頭直到空白鍵）。注意與即時 `ui.py` 的差異：即時框選階段是鏡頭即時畫面在動，這裡是**定格**。
 - **偵測畫面只留精簡三項**（`_draw_slope`）：`slope`（大字＝主結果，前方路面相對水平坡度；無 IMU 時退回 `pitch`）＋一行 `h .. m  roll ..`（相機估計高度＋橫向坡度，當「這片是路面不是牆」的 sanity 燈）。`pitch`(純雙目)/`RMS`/`inliers`/`fps`/`imu` 分量**只寫進 `road_angle.csv`、不上螢幕**。文字顏色仍隨可信度（RMS 小+內點高→綠、否則橘）。
-- **ROI 中心距離讀數只在框選階段**：框選畫面左上疊 `ROI center ~ X.X m`＝ROI 框中心的前向距離 Z（`_patch_depth_m` 取中心小區塊中位 Z），對定格幀**整張算一次視差**（`stereo_from_rectified(..., roi=(0,0,pw,ph))`）供拖框時即時查。用途：直接看出「ROI 框太遠/太近」——若中心距離落在 `z_min_m~z_max_m` 窗外，選點全被距離窗濾掉、每幀擬合失敗（畫面顯示紅色 `？？？？`）。**偵測階段畫面不再顯示這個**（已由 `_draw_slope` 取代成 slope/h/roll）。
-- **操作流程**：圈 ROI（存 `roi.json`，跟即時共用同一個框）→ **Enter** 進偵測（`VideoWorker.active=True`，此時才建 `SessionRecorder` + `detect.mp4` writer + 載入 `ImuTrack`）→ **空白鍵** `stop()` 收尾。切出的是「Enter 到空白鍵」這一段。
+- **ROI 中心距離讀數只在框選階段**：框選畫面左上疊 `ROI center ~ X.X m`＝ROI 框中心的前向距離 Z（`overlay.patch_depth_m` 取中心小區塊中位 Z），對定格幀**整張算一次視差**（`stereo_from_rectified(..., roi=(0,0,pw,ph))`）供拖框時即時查。用途：直接看出「ROI 框太遠/太近」——若中心距離落在 `z_min_m~z_max_m` 窗外，選點全被距離窗濾掉、每幀擬合失敗（畫面顯示紅色 `NO ROAD PLANE`）。**偵測階段畫面不再顯示這個**（已由 `_draw_slope` 取代成 slope/h/roll）。
+- **操作流程**：圈 ROI（存 `roi.json`，跟即時共用同一個框）→ **Enter** 進偵測（`VideoWorker.active=True`，此時才建 `SessionRecorder` + 載入 `ImuTrack`；`detect.mp4` 由 recorder 內部延後建）→ **空白鍵** `stop()` 收尾。切出的是「Enter 到空白鍵」這一段。
 - **IMU 輔助（離線）**：`run_video.py` 的 config 用 `dataclasses.replace(DEFAULT, segment_seconds=0.0, output_dir="output_videos", use_imu=True)`。`use_imu=True` 讓 `VideoWorker` 開偵測時 `ImuTrack.load(cam0, config)` 去讀 **cam0.mp4 同資料夾的 `imu_raw.csv`**（路徑自動推導、不寫死），逐幀補算 `pitch_gravity`。旁邊沒這檔／欄位不對就**靜默退回純雙目**（畫面剩 `pitch`、無 `slope`）。細節見 IMU 節。
-- **輸出到 `output_videos/segment_NNN/`**（**不切段**故整段一個 segment、一張趨勢圖；另開資料夾跟即時錄影的 `output/` 分流）。每段比即時多一個 `detect.mp4`＝疊了綠色路面+精簡坡度文字的偵測畫面（process 解析度 ×`DISPLAY_SCALE`）；`cam0/cam1.mp4` 是那段的原影片、`road_angle.csv`/`road_angle_trend.png` 同即時（有 IMU 時趨勢圖畫 slope，見 IMU 節）。
+- **輸出到 `output_videos/segment_NNN/`**（**不切段**故整段一個 segment、一張趨勢圖；另開資料夾跟即時錄影的 `live_video_output/` 分流）。每段含 `detect.mp4`＝疊了綠色路面+精簡坡度文字的偵測畫面（process 解析度 ×`DISPLAY_SCALE`；即時 `--live --ui` 現在也有，機制共用 `SessionRecorder`）；`cam0/cam1.mp4` 是那段的原影片、`road_angle.csv`/`road_angle_trend.png` 同即時（有 IMU 時趨勢圖畫 slope，見 IMU 節）。
 
 ## 測距驗證工具（`tool/measure_distance.py`，獨立於主管線）
 
-驗證雙目深度準不準的**獨立小工具**，跟主專案（估路面坡度）目的不同：框一個物件 → 雙目量它的距離 → 使用者拿捲尺量實際值比對誤差。**只消費 `src` 的 `calib_loader`/`disparity`/`live`/`video_source`，並沿用 `src/ui.py` 的 `_as_bgr`/`_compose_lr`/`_panel_label`**（`FitVideoLabel` 是它自己的滑鼠拉框元件，不共用 `ui.py` 的 `VideoLabel`，因為顯示縮放不同）。不改 `src`。
+驗證雙目深度準不準的**獨立小工具**，跟主專案（估路面坡度）目的不同：框一個物件 → 雙目量它的距離 → 使用者拿捲尺量實際值比對誤差。**只消費 `src` 的 `calib_loader`/`disparity`/`live`/`video_source`，並沿用 `src/overlay.py` 的 `as_bgr`/`compose_lr`/`panel_label`**（`FitVideoLabel` 是它自己的滑鼠拉框元件，不共用 `ui.py` 的 `VideoLabel`，因為顯示縮放不同；也因此它完全不 import `ui.py`）。不改 `src`。
 
 - **量測公式與主管線完全相同**：一樣走 `disparity.py` 的 rectify → SGBM → `reprojectImageTo3D(Q)` → ÷`depth_scale`。差別只在「事後拿 3D 點做什麼」——這裡取 **ROI 內有效點的中位 Z** 當距離（非擬平面），以及 **`process_scale` 預設 1.0**（求準，主專案即時預設 0.5 求快）。要跟主專案等價比較就 `--scale 0.5`。
 - **入口自足**：`_ROOT = Path(__file__).parent.parent` 把專案根加進 `sys.path` 並鎖定 `calib.npz` 為 `_ROOT/calib.npz`——**不管從哪個 cwd 執行都找得到校正檔**（曾踩過在 `tool/` 裡跑找不到 `calib.npz` 的坑）。
@@ -95,7 +98,8 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 - **`src/disparity.py`** — `StereoMatcher`(StereoSGBM) + `StereoResult`。`compute_stereo` 一步做完；`stereo_from_rectified` 讓 UI「整張只 rectify 一次」還能單獨對 ROI 算視差。
 - **`src/roadplane.py`** — 核心幾何（座標系/角度定義見下）。`plane_inlier_mask()` 產生「哪些像素在這片平面上」給 UI 塗綠。
 - **`src/pairing.py`** — 離線左右幀配對（時間戳/序號，見下）。
-- **`src/live.py`** — Picamera2 即時來源。`src/ui.py` — 即時 PyQt 視窗（背景 QThread 運算）。`src/recorder.py` — session 錄影+CSV+趨勢圖。`src/plot.py` — matplotlib 趨勢圖。`src/cli.py` — 分岔 `main.py` 三模式 + 終端輸出。
+- **`src/overlay.py`** — 偵測疊圖（並排+綠色內點+坡度文字），**純 cv2、不含 Qt**，`ui.py`/`pipeline.py`/`video_ui.py`/`tool/measure_distance.py` 四邊共用。要在畫面上改字/改配色都在這裡。
+- **`src/live.py`** — Picamera2 即時來源。`src/ui.py` — 即時 PyQt 視窗（背景 QThread 運算）。`src/recorder.py` — session 錄影+CSV+趨勢圖+`detect.mp4`。`src/plot.py` — matplotlib 趨勢圖。`src/cli.py` — 分岔 `main.py` 三模式 + 終端輸出。
 - **`src/video_source.py`** — 離線影片來源 `VideoStereo`（介面同 `LiveStereo`，循環播放）。**`src/video_ui.py`** — 影片專用 PyQt 視窗（`VideoWorker`/`VideoWindow`，Enter 開始/空白鍵切段+`detect.mp4`），由 `run_video.py` 啟動，跟 `ui.py` 分開（見「第四種模式」）。
 - **`src/imu.py`** — 即時 IMU 輔助：背景 thread 讀實體 ICM20948、互補濾波算相機 pitch（`ImuReader.pitch_deg`）。`src/imu_track.py` — 離線 IMU 輔助：讀錄影同步存的 `imu_raw.csv`、對齊到每個影片幀（`ImuTrack.pitch_for_frame`）。兩者都是**輔助**、缺了就退回純雙目（見 IMU 節）。`FrameResult.with_imu()` 把相機 pitch 補成 `pitch_gravity_deg`。
 
@@ -117,13 +121,14 @@ CLI 旗標只有 `--live --ui/--no-ui --calib --cam0 --cam1 --out --limit --quie
 ## 非顯而易見的限制
 
 - **`calib.npz` 單位是 mm**（`SQUARE_SIZE_MM` 用 mm、`T`≈62mm 基線）→ `reprojectImageTo3D` 出來也是 mm。`config.depth_scale=1000.0` 負責 mm→m；**動它會讓所有深度/角度全錯**。
-- **cam0=參考/左影像(`P1`)、cam1=右(`P2`, Tx 負)**。視差以 cam0 為基準；`Q` 還原成 cam0 校正座標系。即時 UI (`ui.py`) 把 cam0(左)/cam1(右)兩顆校正後影像**並排顯示**（避免誤會只用單顆），但綠色路面內點只疊在左圖(cam0)——mask 是 cam0 像素座標，右圖同像素被視差平移、塗上去會錯位；右圖只畫黃色 ROI 框。滑鼠拉框設 ROI 只在左圖座標系生效。深度/角度是左右兩張一起算。（`video_ui.py` 離線 UI 也同樣並排顯示 cam0/cam1，並沿用 `ui.py` 的 `_as_bgr`/`_compose_lr`/`_panel_label`；`detect.mp4` 因此也是並排畫面。）
+- **cam0=參考/左影像(`P1`)、cam1=右(`P2`, Tx 負)**。視差以 cam0 為基準；`Q` 還原成 cam0 校正座標系。即時 UI (`ui.py`) 把 cam0(左)/cam1(右)兩顆校正後影像**並排顯示**（避免誤會只用單顆），但綠色路面內點只疊在左圖(cam0)——mask 是 cam0 像素座標，右圖同像素被視差平移、塗上去會錯位；右圖只畫黃色 ROI 框。滑鼠拉框設 ROI 只在左圖座標系生效。深度/角度是左右兩張一起算。（`video_ui.py` 離線 UI 也同樣並排顯示 cam0/cam1，並沿用 `overlay.py` 的 `as_bgr`/`compose_lr`/`panel_label`；`detect.mp4` 因此也是並排畫面。）
 - **RMS 小 ≠ 角度可信**：牆面也是一片乾淨平面（RMS 小、內點高，pitch 卻 ±80°）。光靠 RMS/內點分不出「路面 vs 牆」，要靠幾何合理性（法向量方向/相機高度/pitch 範圍）或穩定的拍攝 + ROI 框。相機沒固定好時逐幀會鎖到不同的面、角度暴衝，這**不是 bug**。
 - **左右幀配對兩種精度，`pairing.iter_pairs` 自動選**：有 `cam*_pts.txt`+`start_time.json` → 絕對時間戳配對（掉幀也對得回）；只有 mp4 → **序號配對**，一邊掉幀後會永遠錯開一幀而不報錯。pts 行序是編碼序需先排序、行數偶爾比可解碼幀多 1（`pairing.py` 已處理）。
 - **即時沒有硬體幀同步**：兩顆 Picamera2 各自 `capture_array()`，左右差幾 ms，車速快時視差略誤。錄影用的 `--sync` 在即時串流沒有等價做法。
 - **`live.py` 的解析度強制 = `calib.native_size`**；`config.live_shutter_us/live_gain` 固定曝光、AWB auto（雙目亮度一致）。**預設 2000µs/1.0＝戶外白天**（對齊上層 `rpi5_dual_camera_capture.py`）；**室內昏暗會太黑，要把 `live_shutter_us`/`live_gain` 調大**（如 20000/4.0）。Picamera2 index 0=i2c@88000=cam0(左)、1=i2c@80000=cam1(右)。
 - **錄影名義 fps 固定 `record_fps`（實際變動）**，播放速度近似；要精準時間看 CSV 的 `time_s` 欄。
-- **UI 疊字用 `cv2.putText` 的 Hershey 字型，畫不出中文**：即時 `ui.py:_draw_text` 與離線 `video_ui.py:_draw_slope` 的失敗訊息「路面擬合失敗」在畫面上都會變成一串紅色 `??????`（每個中文字一個 `?`）。這**不是當機**，就是「這一幀沒擬出平面」的指示（多半因場景裡沒有點落在 `z_min~z_max`，例如室內近物配 `z_min=5m`）。要讓它可讀就把訊息改英文，或換能畫中文的繪字方式。
+- **趨勢圖只畫 pitch/slope 一條線，`roll` 刻意不上圖**：`recorder._write_trend` 傳 `rolls=None` 給 `plot.save_angle_trend`（該參數仍是可選、沒移除）。原因是 roll 的 X 跨度比 Z 短、槓桿更差，資料一爛就暴衝，橘色尖刺會把綠色的 pitch 壓扁到看不出變化。要看「有沒有鎖到路面」用 CSV 的 `cam_height_m`/`n_inliers` 更可靠（roll 仍照樣寫進 CSV、也照樣顯示在畫面）。要畫回來就把 `rolls=None` 換成 `[r.roll_deg for r in self._results]`。
+- **疊字用 `cv2.putText` 的 Hershey 字型，畫不出中文**：`overlay.py:draw_text` 與 `video_ui.py:_draw_slope` 的失敗訊息**已改成英文 `NO ROAD PLANE`**（原本寫中文「路面擬合失敗」，在畫面上會變成一串紅色 `??????`，每個中文字一個 `?`）。**要在畫面上加任何文字都必須用英文**，否則同樣變 `?`（終端機/CSV 的中文不受影響，那是 print 不是 putText）。看到 `NO ROAD PLANE` **不是當機**，是「這一幀沒擬出平面」的指示，多半因為場景裡沒有點落在 `z_min~z_max`（例如 ROI 中心 15m 配 `z_max_m=12`），或畫面太暗/低紋理讓 SGBM 配不出視差。
 
 ## 常見調參：症狀 → 改哪個 `config.py` 參數
 

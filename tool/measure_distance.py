@@ -8,7 +8,8 @@
   4. 按 's'（或按鈕）把當前這筆「量測 / 實際 / 誤差」存進 CSV，方便多量幾組看整體偏差。
 
 跟 src/ 的關係：只**消費** src 的 calib_loader / disparity / live / video_source，
-並沿用 src/ui.py 的滑鼠拉框元件（VideoLabel）與顯示輔助（_as_bgr/_compose_lr/…）。
+並沿用 src/overlay.py 的顯示輔助（as_bgr/compose_lr/panel_label）；拉框元件是自己的
+FitVideoLabel（顯示縮放可變），不 import src/ui.py。
 不改 src。
 
 執行（在 Road_angle/ 底下）：
@@ -55,7 +56,7 @@ from PyQt5.QtWidgets import (
 from src.calib_loader import StereoCalibration, load_calibration
 from src.config import DEFAULT, Config
 from src.disparity import StereoMatcher, stereo_from_rectified
-from src.ui import _as_bgr, _compose_lr, _panel_label
+from src.overlay import as_bgr, compose_lr, panel_label
 
 # 並排畫面顯示時縮放到「總寬不超過這個像素」，避免全解析度(scale=1.0)時視窗被撐爆
 MAX_DISPLAY_WIDTH = 1400
@@ -95,7 +96,7 @@ class MeasureWorker(QThread):
         # 顯示縮放：讓「並排總寬」不超過 MAX_DISPLAY_WIDTH（全解析度也不會撐爆視窗）；
         # 小圖最多放大 2 倍。滑鼠座標會用同一個比例換回 process 座標。
         pw, ph = calib.process_size
-        combo_w = 2 * pw + 4  # _compose_lr 中間有 4px 分隔線
+        combo_w = 2 * pw + 4  # compose_lr 中間有 4px 分隔線
         self.disp_scale = min(2.0, MAX_DISPLAY_WIDTH / combo_w)
 
     def stop(self) -> None:
@@ -166,17 +167,17 @@ class MeasureWorker(QThread):
 
     def _draw(self, rect0, rect1, meas: Measurement | None, fps: float,
               note: str | None = None) -> QImage:
-        left = _as_bgr(rect0)
-        right = _as_bgr(rect1)
+        left = as_bgr(rect0)
+        right = as_bgr(rect1)
 
         if self.roi is not None:
             x0, y0, x1, y1 = self._clamp_roi()
             cv2.rectangle(left, (x0, y0), (x1, y1), (0, 255, 255), 1)
             cv2.rectangle(right, (x0, y0), (x1, y1), (0, 255, 255), 1)
-        _panel_label(left, "L - cam0 (ref)")
-        _panel_label(right, "R - cam1")
+        panel_label(left, "L - cam0 (ref)")
+        panel_label(right, "R - cam1")
 
-        combo = _compose_lr(left, right)
+        combo = compose_lr(left, right)
         s = self.disp_scale
         big = cv2.resize(
             combo, (int(round(combo.shape[1] * s)), int(round(combo.shape[0] * s))),
@@ -214,7 +215,7 @@ class MeasureWorker(QThread):
 class FitVideoLabel(QLabel):
     """顯示畫面並支援滑鼠拉框設 ROI、雙擊清除。
 
-    跟 src/ui.py 的 VideoLabel 一樣，但顯示縮放是可變的浮點 scale（不是固定 ×2），
+    概念跟 src/ui.py 的 VideoLabel 一樣，但顯示縮放是可變的浮點 scale（不是固定 ×2），
     所以滑鼠座標除以這個 scale 換回 process 座標。ROI 只在左圖(cam0)座標系有意義，
     左圖起於 x=0，故直接除以 scale 即得 process 座標。
     """

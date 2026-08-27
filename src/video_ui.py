@@ -11,10 +11,10 @@
          road_angle.csv          每幀角度
          road_angle_trend.png    坡度趨勢圖
 
-運算在背景 QThread。由 run_video.py 啟動。跟 ui.py 共用的只有通用顯示元件
-（VideoLabel 滑鼠拉框、_as_bgr/_compose_lr/_panel_label 疊圖、DISPLAY_SCALE）；
-偵測畫面的文字改由本檔自己的 _draw_slope 畫（精簡版，跟即時 ui.py 的 _draw_text
-分開），其餘完全獨立、不影響即時模式。
+運算在背景 QThread。由 run_video.py 啟動。跟即時模式共用的只有 ui.py 的 VideoLabel
+（滑鼠拉框）與 overlay.py 的通用疊圖元件（as_bgr/compose_lr/panel_label/
+patch_depth_m/DISPLAY_SCALE）；偵測畫面的文字改由本檔自己的 _draw_slope 畫（精簡版，
+跟 overlay.draw_text 分開），其餘完全獨立、不影響即時模式。
 """
 
 from __future__ import annotations
@@ -33,13 +33,14 @@ from .pipeline import FrameResult
 from .recorder import SessionRecorder
 from .roadplane import fit_road_plane, plane_inlier_mask, select_road_points
 from .roi_store import load_roi, save_roi
-from .ui import (  # 通用顯示元件，沿用不重造
+from .overlay import (  # 通用疊圖元件（純 cv2，跟 Qt 無關），沿用不重造
     DISPLAY_SCALE,
-    VideoLabel,
-    _as_bgr,
-    _compose_lr,
-    _panel_label,
+    as_bgr,
+    compose_lr,
+    panel_label,
+    patch_depth_m,
 )
+from .ui import VideoLabel  # 滑鼠拉框的 Qt 元件
 from .video_source import VideoStereo
 
 
@@ -53,8 +54,9 @@ def _draw_slope(img: np.ndarray, plane, fr: FrameResult) -> None:
     文字顏色沿用可信度：RMS 小且內點比例高→綠、否則橘（隱含 RMS/內點，不再列數字）。
     cv2 Hershey 畫不出中文：擬合失敗訊息會顯示為紅色 ??????（非當機，見 CLAUDE.md）。"""
     if plane is None:
+        # 必須是英文：cv2 的 Hershey 字型沒有中文字形，中文會整串變成紅色 ??????
         for w, col in ((5, (0, 0, 0)), (2, (0, 0, 255))):
-            cv2.putText(img, "路面擬合失敗", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, w)
+            cv2.putText(img, "NO ROAD PLANE", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, w)
         return
     ratio = fr.n_inliers / fr.n_road_points if fr.n_road_points else 0.0
     good = plane.rms_m * 100 < 4.0 and ratio > 0.5
@@ -115,7 +117,7 @@ class VideoWorker(QThread):
         while self._running and not self.active:
             rect = self._roi_rect(pw, ph, matcher.roi_fraction)
             cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
-            z = self._patch_depth_m(res_frozen, cx - res_frozen.x0, cy - res_frozen.y0)
+            z = patch_depth_m(res_frozen, cx - res_frozen.x0, cy - res_frozen.y0)
             self.frameReady.emit(self._draw_preview(rect0_frozen, rect1_frozen, rect, z), None)
             self.msleep(50)  # 約 20fps 重畫，讓 ROI 框跟手；底圖同一張不動
         if not self._running:
@@ -126,7 +128,6 @@ class VideoWorker(QThread):
         # 逐幀相機 pitch，補算相對水平面的真實坡度（pitch_gravity）。沒有就 None＝純雙目。
         imu_track = ImuTrack.load(self.cam0, self.config) if self.config.use_imu else None
         recorder = None  # 進偵測才建，避免框選階段就開一個空 segment
-        detect_vw = None  # 疊好圖的偵測影片 writer
         i = 0
         try:
             with VideoStereo(self.cam0, self.cam1, size=self.calib.native_size, loop=True) as cams:
@@ -163,22 +164,17 @@ class VideoWorker(QThread):
                     )
                     if imu_track is not None:  # 補算相對水平面的真實坡度（pitch_gravity）
                         fr.with_imu(imu_track.pitch_for_frame(i))
-                    recorder.add(img0, img1, fr)  # 原影片（native cam0/cam1）+ 累積角度
 
+                    # 原影片（native cam0/cam1）+ 累積角度 + 偵測影片（並排疊圖 detect.mp4）。
+                    # detect 的 writer 由 recorder 管，切段時才會跟著換到新的 segment。
                     big = self._annotate(rect0, rect1, res, plane, fr)  # 並排 BGR 畫面
-                    if detect_vw is None:  # 用實際並排畫面尺寸建 writer（左右並排比單圖寬）
-                        detect_vw = cv2.VideoWriter(
-                            str(recorder.dir / "detect.mp4"),
-                            cv2.VideoWriter_fourcc(*"mp4v"),
-                            self.config.record_fps,
-                            (big.shape[1], big.shape[0]),
-                        )
-                    detect_vw.write(big)  # 偵測影片
+                    recorder.add(
+                        img0, img1, fr,
+                        overlay=big if self.config.record_detect else None,
+                    )
                     self.frameReady.emit(self._to_qimage(big), fr)
                     i += 1
         finally:
-            if detect_vw is not None:
-                detect_vw.release()
             if recorder is not None:
                 seg = recorder.close()  # 寫 CSV + 趨勢圖、封 mp4
                 self.sessionSaved.emit(str(seg))
@@ -200,14 +196,14 @@ class VideoWorker(QThread):
     ) -> QImage:
         """框選階段畫面：cam0(左)/cam1(右) 校正後並排預覽 + 黃色 ROI 框（兩顆都畫，強調
         左右一起算視差）+ 英文提示 + ROI 中心距離（cv2 畫不出中文）。"""
-        left = _as_bgr(rect0)
-        right = _as_bgr(rect1)
+        left = as_bgr(rect0)
+        right = as_bgr(rect1)
         x0, y0, x1, y1 = roi_rect
         cv2.rectangle(left, (x0, y0), (x1, y1), (0, 255, 255), 1)
         cv2.rectangle(right, (x0, y0), (x1, y1), (0, 255, 255), 1)
-        _panel_label(left, "L - cam0 (ref)")
-        _panel_label(right, "R - cam1")
-        combo = _compose_lr(left, right)  # 左圖仍起於 x=0，滑鼠 ROI 對映不變
+        panel_label(left, "L - cam0 (ref)")
+        panel_label(right, "R - cam1")
+        combo = compose_lr(left, right)  # 左圖仍起於 x=0，滑鼠 ROI 對映不變
         big = cv2.resize(
             combo, (combo.shape[1] * DISPLAY_SCALE, combo.shape[0] * DISPLAY_SCALE),
             interpolation=cv2.INTER_NEAREST,
@@ -222,8 +218,8 @@ class VideoWorker(QThread):
         """cam0(左)/cam1(右) 校正後並排 + 精簡角度文字，回傳放大後的 BGR 畫面（顯示與偵測
         影片共用）。綠色路面內點只疊在左圖(cam0)：mask 是 cam0 像素座標，右圖同像素被視差
         平移、塗上去會錯位；黃色 ROI 框兩顆都畫。"""
-        left = _as_bgr(rect0)
-        right = _as_bgr(rect1)
+        left = as_bgr(rect0)
+        right = as_bgr(rect1)
         x0, y0 = res.x0, res.y0
         h_roi, w_roi = res.pts.shape[:2]
         if plane is not None:  # 綠色：路面內點（角度依據，只畫在左圖 cam0）
@@ -232,34 +228,15 @@ class VideoWorker(QThread):
             sub[mask] = (0.4 * sub[mask] + 0.6 * np.array([0, 255, 0])).astype(np.uint8)
         cv2.rectangle(left, (x0, y0), (x0 + w_roi, y0 + h_roi), (0, 255, 255), 1)  # 黃框 ROI
         cv2.rectangle(right, (x0, y0), (x0 + w_roi, y0 + h_roi), (0, 255, 255), 1)
-        _panel_label(left, "L - cam0 (ref)")
-        _panel_label(right, "R - cam1")
-        combo = _compose_lr(left, right)
+        panel_label(left, "L - cam0 (ref)")
+        panel_label(right, "R - cam1")
+        combo = compose_lr(left, right)
         big = cv2.resize(
             combo, (combo.shape[1] * DISPLAY_SCALE, combo.shape[0] * DISPLAY_SCALE),
             interpolation=cv2.INTER_NEAREST,
         )
         _draw_slope(big, plane, fr)
         return big
-
-    @staticmethod
-    def _patch_depth_m(res, cx: int, cy: int, half: int = 8) -> float | None:
-        """res 中心 (cx,cy) 附近小區塊的中位 Z（公尺，前向距離）；無有效點回 None。
-
-        cx,cy 是 res 陣列的局部座標（框選階段整張算故＝process 座標；偵測階段 res 已是
-        ROI 子區塊故傳中心 w//2,h//2）。取小區塊中位數避開單一像素的視差雜訊。
-        """
-        zs = res.pts[..., 2]
-        valid = res.valid & np.isfinite(zs)
-        h, w = zs.shape
-        y0 = max(0, cy - half); y1 = min(h, cy + half + 1)
-        x0 = max(0, cx - half); x1 = min(w, cx + half + 1)
-        if y1 <= y0 or x1 <= x0:
-            return None
-        pz = zs[y0:y1, x0:x1][valid[y0:y1, x0:x1]]
-        if pz.size == 0:
-            return None
-        return float(np.median(pz))
 
     @staticmethod
     def _to_qimage(big: np.ndarray) -> QImage:

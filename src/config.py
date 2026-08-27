@@ -87,15 +87,22 @@ class Config:
     imu_mount_pitch_offset_deg: float = 90.0  # 安裝俯角補回（正值：相機朝下、水平面在相機前方）
 
     # === 錄影 / session 輸出（寫死一律開啟）===
-    # 即時模式一律把 cam0/cam1 錄到 output/segment_NNN/（遞增編號、不覆蓋），
+    # 即時模式一律把 cam0/cam1 錄到 live_video_output/segment_NNN/（遞增編號、不覆蓋），
     # 並輸出 road_angle.csv + road_angle_trend.png。
+    # 註：離線 run_video.py 另外用 replace(output_dir="output_videos") 覆寫，不受這裡影響。
     record: bool = True
-    output_dir: str = "output"
+    output_dir: str = "live_video_output"
     record_fps: float = 10.0  # 影片名義 fps（實際變動，播放速度為近似）
     # 每滿這麼多秒就把當前 segment 收好（寫 CSV/趨勢圖、封 mp4）、換下一段遞增編號。
     # 好處：即時模式跑越久也不怕中途掛掉——最多只損失最後不到這段時間的資料。
     # 設 0（或負值）= 不輪替，維持舊行為（整段只在 Ctrl+C 停止時才一次寫出）。
     segment_seconds: float = 60.0  # 1 分鐘
+    # 每段多存一支 detect.mp4＝畫面上看到的偵測疊圖（cam0/cam1 並排、左圖疊綠色路面
+    # + 坡度文字），解析度是 process_size×DISPLAY_SCALE，跟 cam0/cam1.mp4 的 native
+    # 原影片分開。只有「有疊圖畫面可存」的兩個 UI 模式吃得到（--live --ui 與
+    # run_video.py）；headless 純 --live 不畫圖，設 True 也不會有 detect.mp4。
+    # 嫌多佔空間/想省一點 CPU 就設 False。
+    record_detect: bool = True
 
 
 # 全域預設；整個管線都用它，除非呼叫端特別覆寫。

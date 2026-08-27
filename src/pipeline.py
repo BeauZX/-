@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -19,7 +20,8 @@ import numpy as np
 
 from .calib_loader import StereoCalibration
 from .config import DEFAULT, Config
-from .disparity import StereoMatcher, StereoResult, compute_stereo
+from .disparity import StereoMatcher, StereoResult, compute_stereo, stereo_from_rectified
+from .overlay import annotate_frame  # 純 cv2 疊圖（不含 Qt），headless 也能畫 detect.mp4
 from .pairing import iter_pairs
 from .roadplane import RoadPlane, fit_road_plane, select_road_points
 
@@ -68,14 +70,15 @@ class FrameResult:
         )
 
 
-def estimate_from_result(
+def estimate_with_plane(
     config: Config,
     rng: np.random.Generator,
     index: int,
     res: StereoResult,
     time_diff_ms: float | None = None,
-) -> FrameResult:
-    """已算好的 StereoResult → 路面坡度。UI worker 用這個（算一次可兼顧畫圖）。"""
+) -> tuple[FrameResult, RoadPlane | None]:
+    """同 estimate_from_result，但連 RoadPlane 一起回傳——疊圖要用它畫綠色內點
+    （`overlay.annotate_frame`）。純算數值的呼叫端用 estimate_from_result 就好。"""
     # 影像橫帶已由 disparity 的 ROI 裁切處理，這裡不再重複裁列 (=1.0)，
     # 只靠距離/高度過濾 + RANSAC 把非路面點濾掉。
     road = select_road_points(
@@ -94,8 +97,19 @@ def estimate_from_result(
         rng=rng,
     )
     if plane is None:
-        return FrameResult.failed(index, len(road), time_diff_ms)
-    return FrameResult.from_plane(index, plane, time_diff_ms)
+        return FrameResult.failed(index, len(road), time_diff_ms), None
+    return FrameResult.from_plane(index, plane, time_diff_ms), plane
+
+
+def estimate_from_result(
+    config: Config,
+    rng: np.random.Generator,
+    index: int,
+    res: StereoResult,
+    time_diff_ms: float | None = None,
+) -> FrameResult:
+    """已算好的 StereoResult → 路面坡度。UI worker 用這個（算一次可兼顧畫圖）。"""
+    return estimate_with_plane(config, rng, index, res, time_diff_ms)[0]
 
 
 def estimate_pair(
@@ -143,6 +157,7 @@ def process_live(
     recorder=None,
     roi: tuple[int, int, int, int] | None = None,
     imu=None,
+    annotate: bool = False,
 ) -> Iterator[FrameResult]:
     """接兩顆即時鏡頭，逐幀產生路面坡度結果，直到 Ctrl+C 或達到 max_frames。
 
@@ -151,6 +166,9 @@ def process_live(
     的 roi.json，跟 UI 模式吃同一個框。
     imu（ImuReader，可選）非 None 時，每幀取最新相機 pitch 補算相對水平面的真實坡度
     （pitch_gravity_deg）；None＝不做 IMU 修正，只有純雙目相機相對坡度。
+    annotate=True 時每幀多畫一張疊圖（綠色路面+坡度文字）餵給 recorder 寫 detect.mp4，
+    畫面內容跟 `--ui` 看到的一樣。headless 本來沒有畫圖成本，開了會慢一些（多一次
+    resize+putText+mp4 編碼），純看數字/求快就維持 False（config.record_detect）。
     """
     from .live import LiveStereo  # 延後 import：只有即時模式才需要 picamera2
 
@@ -159,12 +177,23 @@ def process_live(
 
     with LiveStereo(config, size=calib.image_size) as cams:
         i = 0
+        fps = 0.0
+        t_prev = time.monotonic()
         for img0, img1 in cams.frames():
-            fr = estimate_pair(calib, matcher, config, rng, i, img0, img1, None, roi)
+            # 拆開 rectify/視差兩步（＝compute_stereo 的內容，成本相同），疊圖需要校正影像
+            rect0, rect1 = calib.rectify(img0, img1)
+            res = stereo_from_rectified(rect0, rect1, calib.Q, matcher, roi)
+            fr, plane = estimate_with_plane(config, rng, i, res, None)
             if imu is not None:
                 fr.with_imu(imu.pitch_deg)
+            overlay = None
+            if annotate:
+                now = time.monotonic()
+                fps = 0.9 * fps + 0.1 * (1.0 / max(1e-6, now - t_prev))
+                t_prev = now
+                overlay = annotate_frame(rect0, rect1, res, plane, fr, config, fps)
             if recorder is not None:
-                recorder.add(img0, img1, fr)
+                recorder.add(img0, img1, fr, overlay=overlay)
             yield fr
             i += 1
             if max_frames is not None and i >= max_frames:

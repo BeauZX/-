@@ -204,8 +204,12 @@ def _run_live(calib, args, *, record: bool = False) -> int:
 
     pitches: list[float] = []
     with ImuReader(DEFAULT) as imu:
+        # 有錄影就順便畫疊圖存 detect.mp4（跟 --ui 看到的同一張畫面）。headless 本來
+        # 不畫圖，開了會慢一點；不要就把 config.record_detect 設 False。
+        annotate = recorder is not None and DEFAULT.record_detect
         results = process_live(
-            calib, config=DEFAULT, max_frames=args.limit, recorder=recorder, roi=roi, imu=imu
+            calib, config=DEFAULT, max_frames=args.limit, recorder=recorder, roi=roi,
+            imu=imu, annotate=annotate,
         )
         writer_ctx = _open_csv(Path(args.out)) if args.out else _null_csv()
         try:
@@ -219,7 +223,8 @@ def _run_live(calib, args, *, record: bool = False) -> int:
             if recorder is not None:
                 recorder.close()
                 n = len(recorder.segments)
-                print(f"已存 {n} 段 → {DEFAULT.output_dir}/（每段含 cam0/cam1.mp4, road_angle.csv, road_angle_trend.png）")
+                det = ", detect.mp4" if DEFAULT.record_detect else ""
+                print(f"已存 {n} 段 → {DEFAULT.output_dir}/（每段含 cam0/cam1.mp4{det}, road_angle.csv, road_angle_trend.png）")
     if args.out:
         print(f"CSV → {args.out}")
     _print_summary(pitches)

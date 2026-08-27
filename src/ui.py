@@ -18,6 +18,10 @@
   - 「雙擊」＝清除 ROI，回到預設下方橫帶
 
 運算在背景 QThread，GUI 只負責畫。由 CLI `--ui`（或 config.show_ui=True）啟動。
+
+錄影：每段除了 native 解析度的 cam0/cam1.mp4，還會把「畫面上看到的這張疊圖」原樣
+存成 detect.mp4（`config.record_detect`，跟離線 run_video.py 同名同內容）。疊圖只畫
+一次、顯示與錄影共用（`_draw` 回傳 BGR，`_to_qimage` 才轉給 Qt）。
 """
 
 from __future__ import annotations
@@ -40,11 +44,17 @@ from PyQt5.QtWidgets import (
 from .calib_loader import StereoCalibration
 from .config import Config
 from .disparity import StereoMatcher, stereo_from_rectified
+from .overlay import (  # 疊圖是純 cv2 的、跟 Qt 無關，故獨立在 overlay.py（headless 也用）
+    DISPLAY_SCALE,
+    annotate_frame,
+    as_bgr,
+    compose_lr,
+    panel_label,
+    patch_depth_m,
+)
 from .pipeline import FrameResult
-from .roadplane import fit_road_plane, plane_inlier_mask, select_road_points
+from .roadplane import fit_road_plane, select_road_points
 from .roi_store import load_roi, save_roi
-
-DISPLAY_SCALE = 2  # 影像放大顯示倍率；滑鼠座標除以它換回 process 座標
 
 
 class StereoWorker(QThread):
@@ -128,50 +138,26 @@ class StereoWorker(QThread):
                         if plane is None
                         else FrameResult.from_plane(i, plane, None)
                     )
-                    if recorder is not None:
-                        recorder.add(img0, img1, fr)
-
                     now = time.monotonic()
                     fps = 0.9 * fps + 0.1 * (1.0 / max(1e-6, now - t_prev))
                     t_prev = now
 
-                    qimg = self._draw(rect0, rect1, res, plane, fr, fps)
-                    self.frameReady.emit(qimg, fr)
+                    # 先疊圖再錄：畫好的 big 同時餵給畫面與 detect.mp4（同一張，不重畫）
+                    big = annotate_frame(rect0, rect1, res, plane, fr, self.config, fps)
+                    if recorder is not None:
+                        recorder.add(
+                            img0, img1, fr,
+                            overlay=big if self.config.record_detect else None,
+                        )
+                    self.frameReady.emit(self._to_qimage(big), fr)
                     i += 1
         finally:
             if recorder is not None:
                 seg = recorder.close()
                 self.sessionSaved.emit(str(seg))
 
-    def _draw(self, rect0, rect1, res, plane, fr: FrameResult, fps: float) -> QImage:
-        left = _as_bgr(rect0)
-        right = _as_bgr(rect1)
-        x0, y0 = res.x0, res.y0
-        h_roi, w_roi = res.pts.shape[:2]
-
-        # 綠色：路面內點（角度的依據）。只畫在左(cam0)：mask 是 cam0 像素座標，
-        # 右圖同像素被視差平移，塗上去會錯位。
-        if plane is not None:
-            mask = plane_inlier_mask(res.pts, res.valid, plane, self.config.ransac_threshold_m)
-            sub = left[y0 : y0 + h_roi, x0 : x0 + w_roi]
-            sub[mask] = (0.4 * sub[mask] + 0.6 * np.array([0, 255, 0])).astype(np.uint8)
-
-        # 黃框：ROI（兩顆都畫，強調左右一起算視差）
-        cv2.rectangle(left, (x0, y0), (x0 + w_roi, y0 + h_roi), (0, 255, 255), 1)
-        cv2.rectangle(right, (x0, y0), (x0 + w_roi, y0 + h_roi), (0, 255, 255), 1)
-        _panel_label(left, "L - cam0 (ref)")
-        _panel_label(right, "R - cam1")
-
-        # 並排合成後再放大（左圖仍起於 x=0，滑鼠 ROI 對映不變）
-        combo = _compose_lr(left, right)
-        big = cv2.resize(
-            combo, (combo.shape[1] * DISPLAY_SCALE, combo.shape[0] * DISPLAY_SCALE),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        # ROI 中心距離：重用已算好的 res（零額外成本），供偵測階段驗證框住物件的前向距離；
-        # 物件不是路面故 plane 常為 None，但距離讀數不受影響照樣顯示。
-        z_center = self._patch_depth_m(res, w_roi // 2, h_roi // 2)
-        _draw_text(big, plane, fr, fps, z_center)
+    @staticmethod
+    def _to_qimage(big: np.ndarray) -> QImage:
         rgb = cv2.cvtColor(big, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
@@ -198,37 +184,21 @@ class StereoWorker(QThread):
             return None
         res = stereo_from_rectified(rect0, rect1, self.calib.Q, matcher, rect)
         h_roi, w_roi = res.pts.shape[:2]
-        return self._patch_depth_m(res, w_roi // 2, h_roi // 2)
-
-    @staticmethod
-    def _patch_depth_m(res, cx: int, cy: int, half: int = 8) -> float | None:
-        """res 中心 (cx,cy) 附近小區塊的中位 Z（公尺，前向距離）；無有效點回 None。
-        取小區塊中位數避開單一像素的視差雜訊。"""
-        zs = res.pts[..., 2]
-        valid = res.valid & np.isfinite(zs)
-        h, w = zs.shape
-        y0 = max(0, cy - half); y1 = min(h, cy + half + 1)
-        x0 = max(0, cx - half); x1 = min(w, cx + half + 1)
-        if y1 <= y0 or x1 <= x0:
-            return None
-        pz = zs[y0:y1, x0:x1][valid[y0:y1, x0:x1]]
-        if pz.size == 0:
-            return None
-        return float(np.median(pz))
+        return patch_depth_m(res, w_roi // 2, h_roi // 2)
 
     def _draw_preview(
         self, rect0, rect1, roi_rect: tuple[int, int, int, int], z_center: float | None = None
     ) -> QImage:
         """框選階段的畫面：cam0/cam1 校正後並排預覽 + 黃色 ROI 框 + 「按 Enter 開始」
         提示 + ROI 中心距離（英文，避免 cv2 Hershey 畫不出中文變 ??? ）。"""
-        left = _as_bgr(rect0)
-        right = _as_bgr(rect1)
+        left = as_bgr(rect0)
+        right = as_bgr(rect1)
         x0, y0, x1, y1 = roi_rect
         cv2.rectangle(left, (x0, y0), (x1, y1), (0, 255, 255), 1)
         cv2.rectangle(right, (x0, y0), (x1, y1), (0, 255, 255), 1)
-        _panel_label(left, "L - cam0 (ref)")
-        _panel_label(right, "R - cam1")
-        combo = _compose_lr(left, right)
+        panel_label(left, "L - cam0 (ref)")
+        panel_label(right, "R - cam1")
+        combo = compose_lr(left, right)
         big = cv2.resize(
             combo, (combo.shape[1] * DISPLAY_SCALE, combo.shape[0] * DISPLAY_SCALE),
             interpolation=cv2.INTER_NEAREST,
@@ -237,65 +207,7 @@ class StereoWorker(QThread):
         for text, yy in (("Frame road ROI", 26), ("press ENTER to start", 56), (depth, 86)):
             cv2.putText(big, text, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
             cv2.putText(big, text, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        rgb = cv2.cvtColor(big, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-
-
-def _as_bgr(rect) -> np.ndarray:
-    """校正影像轉可疊色的 BGR 副本（灰階→BGR，彩色則 copy 不動原圖）。"""
-    img = rect.copy()
-    if img.ndim == 2:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    return img
-
-
-def _compose_lr(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    """cam0(左)、cam1(右)水平並排，中間一條深灰分隔線。兩者同為 process_size。"""
-    sep = np.full((left.shape[0], 4, 3), 60, np.uint8)
-    return np.hstack([left, sep, right])
-
-
-def _panel_label(img: np.ndarray, text: str) -> None:
-    """在單一 panel 左下角標 L/R 鏡頭來源（黑描邊 + 黃字）。"""
-    y = img.shape[0] - 6
-    cv2.putText(img, text, (6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
-    cv2.putText(img, text, (6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-
-
-def _draw_text(img, plane, fr: FrameResult, fps: float, z_center: float | None = None) -> None:
-    """畫面只留主結果 + 一盞 sanity 燈，其餘（pitch/RMS/inliers/fps/imu）不上螢幕、
-    全留在 road_angle.csv（跟離線 video_ui._draw_slope 一致）：
-
-        slope <大字>        前方路面相對水平面的坡度（雙目+IMU；無 IMU 退回純雙目 pitch）
-        h .. m   roll ..    相機估計高度 + 橫向坡度（確認擬到的是路面、不是牆）
-        ROI ~ X.X m         ROI 中心的前向距離（黃字），驗證框住物件的距離用；不論有無平面都畫
-
-    文字顏色沿用可信度：RMS 小且內點比例高→綠、否則橘（隱含 RMS/內點，不再列數字）。
-    註：距離用 process_scale（預設 0.5）算，求快犧牲精度；要準的誤差驗證用 tool/measure_distance.py。"""
-    # ROI 中心距離獨立於平面：框物件時擬不出路面平面，但距離讀數照樣要能驗證
-    if z_center is not None:
-        for w, c in ((4, (0, 0, 0)), (2, (0, 255, 255))):
-            cv2.putText(img, f"ROI ~ {z_center:.1f} m", (10, 112),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, w)
-    if plane is None:
-        for w, col in ((5, (0, 0, 0)), (2, (0, 0, 255))):
-            cv2.putText(img, "路面擬合失敗", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, w)
-        return
-    ratio = fr.n_inliers / fr.n_road_points if fr.n_road_points else 0.0
-    good = plane.rms_m * 100 < 4.0 and ratio > 0.5
-    col = (0, 255, 0) if good else (0, 165, 255)
-    # 主結果：有 IMU → slope（相對水平）；沒有 → 退回純雙目 pitch（相機相對）
-    head = (
-        f"slope {fr.pitch_gravity_deg:+.1f}"
-        if fr.pitch_gravity_deg is not None
-        else f"pitch {fr.pitch_deg:+.1f}"
-    )
-    for w, c in ((6, (0, 0, 0)), (3, col)):  # 黑描邊 + 彩字，放大當標題
-        cv2.putText(img, head, (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 1.2, c, w)
-    sub = f"h {fr.cam_height_m:.2f}m   roll {fr.roll_deg:+.1f}"
-    for w, c in ((4, (0, 0, 0)), (2, col)):
-        cv2.putText(img, sub, (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, w)
+        return self._to_qimage(big)
 
 
 class VideoLabel(QLabel):
@@ -400,7 +312,8 @@ class MainWindow(QWidget):
         self.video.setFixedSize(qimg.width(), qimg.height())
 
     def _on_saved(self, seg: str) -> None:
-        self.hint.setText(f"已存到 {seg}（cam0/cam1.mp4 + CSV + 趨勢圖）")
+        extra = " + detect.mp4 偵測影片" if self.config.record_detect else ""
+        self.hint.setText(f"已存到 {seg}（cam0/cam1.mp4{extra} + CSV + 趨勢圖）")
 
     def closeEvent(self, event) -> None:
         self.worker.stop()

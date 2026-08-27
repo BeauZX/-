@@ -2,6 +2,7 @@
 
 每次啟動在 output/ 底下開一個「遞增編號、不覆蓋」的資料夾 segment_NNN，內含：
     cam0.mp4 / cam1.mp4   原生解析度的左右影像（可再拿去離線重跑）
+    detect.mp4            偵測疊圖畫面（呼叫端有傳 overlay 才有；見 add()）
     road_angle.csv        每幀角度 + 時間戳
     road_angle_trend.png  pitch/roll 隨時間的趨勢圖
 
@@ -69,6 +70,9 @@ class SessionRecorder:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.vw0 = cv2.VideoWriter(str(self.dir / "cam0.mp4"), fourcc, self.fps, (w, h))
         self.vw1 = cv2.VideoWriter(str(self.dir / "cam1.mp4"), fourcc, self.fps, (w, h))
+        # detect.mp4 的尺寸是疊圖畫面的尺寸（並排+放大，跟 native 不同），開段時還不知道，
+        # 等第一幀 overlay 進來才建；沒人傳 overlay 的話這段就不會有 detect.mp4。
+        self.vw_det: cv2.VideoWriter | None = None
         self._results: list[FrameResult] = []
         self._times: list[float] = []
         self._t0 = time.monotonic()
@@ -76,16 +80,39 @@ class SessionRecorder:
     def _finalize_segment(self) -> None:
         self.vw0.release()
         self.vw1.release()
+        if self.vw_det is not None:
+            self.vw_det.release()
         self._write_csv()
         self._write_trend()
 
-    def add(self, img0: np.ndarray, img1: np.ndarray, fr: FrameResult) -> None:
+    def add(
+        self,
+        img0: np.ndarray,
+        img1: np.ndarray,
+        fr: FrameResult,
+        overlay: np.ndarray | None = None,
+    ) -> None:
+        """記一幀。overlay（可選）＝畫面上看到的偵測疊圖 BGR 影像，有傳就寫進 detect.mp4。
+
+        overlay 尺寸由第一幀決定、之後不可改（cv2.VideoWriter 尺寸不符會靜默丟幀）；
+        疊圖畫面是固定的 process_size×DISPLAY_SCALE 並排圖，故此前提成立。
+        """
         # 當前 segment 滿了就先收好、再開新的一段（下面這幀寫進新段）。
         if self.segment_seconds > 0 and (time.monotonic() - self._t0) >= self.segment_seconds:
             self._finalize_segment()
             self._open_segment()
         self.vw0.write(img0)
         self.vw1.write(img1)
+        if overlay is not None:
+            if self.vw_det is None:  # 用實際疊圖尺寸建 writer（輪替後的新段會再建一次）
+                h, w = overlay.shape[:2]
+                self.vw_det = cv2.VideoWriter(
+                    str(self.dir / "detect.mp4"),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    self.fps,
+                    (w, h),
+                )
+            self.vw_det.write(overlay)
         self._results.append(fr)
         self._times.append(time.monotonic() - self._t0)
 
@@ -113,7 +140,10 @@ class SessionRecorder:
 
     def _write_trend(self) -> None:
         idx = [r.index for r in self._results]
-        rol = [r.roll_deg for r in self._results]
+        # roll 刻意不上圖：它不是主結果，而且資料一爛就暴衝(X 跨度比 Z 短、槓桿更差)，
+        # 尖刺會蓋掉綠色的 pitch。判斷「有沒有鎖到路面」看 CSV 的 cam_height_m/n_inliers
+        # 更可靠。要畫回來就把下面 save_angle_trend 的 rolls=None 換成
+        # [r.roll_deg for r in self._results]。
         # 有 IMU 輔助（任一幀算出相對水平坡度）就畫 slope(pitch_gravity)，扣掉安裝俯角，
         # 綠線會落在真實坡度附近；否則退回純雙目 pitch（相對相機光軸、含安裝俯角）。
         has_imu = any(r.pitch_gravity_deg is not None for r in self._results)
@@ -124,7 +154,7 @@ class SessionRecorder:
             pit = [r.pitch_deg for r in self._results]
             title, label = "Road pitch trend", "pitch (longitudinal)"
         save_angle_trend(
-            str(self.dir / "road_angle_trend.png"), idx, pit, rol,
+            str(self.dir / "road_angle_trend.png"), idx, pit, rolls=None,
             title=title, pitch_label=label,
         )
 
