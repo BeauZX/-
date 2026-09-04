@@ -19,6 +19,13 @@
 
 運算在背景 QThread，GUI 只負責畫。由 CLI `--ui`（或 config.show_ui=True）啟動。
 
+IMU 輔助（`config.use_imu=True` 時）：worker 另開一個 `ImuReader` 背景執行緒讀實體
+ICM20948，每幀 `fr.with_imu()` 把相機自身 pitch 補進結果，得到相對水平面的真實坡度
+（`slope` ＝ 雙目 pitch ＋ IMU pitch）。關閉或硬體讀不到時 `pitch_deg` 回 None、
+`with_imu` 變 no-op，畫面自動退回純雙目 `pitch`——**這條路徑沒開 IMU 時行為完全不變**。
+IMU 讀值本身只進 CSV 的 `imu_pitch_deg` 欄、不上疊圖（沿用 overlay.py 的取捨），
+要確認有沒有吃到 IMU 看視窗底下提示列的狀態標記。
+
 錄影：每段除了 native 解析度的 cam0/cam1.mp4，還會把「畫面上看到的這張疊圖」原樣
 存成 detect.mp4（`config.record_detect`，跟離線 run_video.py 同名同內容）。疊圖只畫
 一次、顯示與錄影共用（`_draw` 回傳 BGR，`_to_qimage` 才轉給 Qt）。
@@ -62,6 +69,7 @@ class StereoWorker(QThread):
 
     frameReady = pyqtSignal(QImage, object)
     sessionSaved = pyqtSignal(str)
+    imuStatus = pyqtSignal(bool)  # 開鏡頭後回報 IMU 有沒有真的接上（供提示列顯示）
 
     def __init__(self, calib: StereoCalibration, config: Config, record: bool = False) -> None:
         super().__init__()
@@ -78,6 +86,7 @@ class StereoWorker(QThread):
         self._running = False
 
     def run(self) -> None:
+        from .imu import ImuReader  # config.use_imu 關閉時 available=False，不影響其餘流程
         from .live import LiveStereo  # 延後 import，只有 UI 才需要 picamera2
 
         matcher = StereoMatcher.from_config(self.config)
@@ -89,7 +98,11 @@ class StereoWorker(QThread):
         roi_z: float | None = None  # 框選階段 ROI 中心的前向距離（公尺），節流量測後快取
         roi_z_t = 0.0
         try:
-            with LiveStereo(self.config, size=self.calib.native_size) as cams:
+            # ImuReader 先開：它的互補濾波要一點時間收斂，而開鏡頭(libcamera 初始化)很慢，
+            # 排在前面等於免費讓 IMU 先暖機，第一幀就能拿到穩定的 pitch。
+            with ImuReader(self.config) as imu, \
+                    LiveStereo(self.config, size=self.calib.native_size) as cams:
+                self.imuStatus.emit(imu.available)
                 for img0, img1 in cams.frames():
                     if not self._running:
                         break
@@ -138,6 +151,9 @@ class StereoWorker(QThread):
                         if plane is None
                         else FrameResult.from_plane(i, plane, None)
                     )
+                    # IMU 輔助：補成相對水平面的真實坡度。必須排在 annotate_frame 之前
+                    # ——疊圖靠 fr.pitch_gravity_deg 決定標題印 slope 還是 pitch。
+                    fr.with_imu(imu.pitch_deg)
                     now = time.monotonic()
                     fps = 0.9 * fps + 0.1 * (1.0 / max(1e-6, now - t_prev))
                     t_prev = now
@@ -254,7 +270,9 @@ class MainWindow(QWidget):
         self._record = record
         self.setFocusPolicy(Qt.StrongFocus)  # 讓視窗收得到 Enter 鍵
         self.video = VideoLabel()
-        self.hint = QLabel(
+        self._imu_ok = False  # 開鏡頭後由 worker 的 imuStatus 更新
+        self.hint = QLabel()
+        self._set_hint(
             "框選階段：滑鼠拉框設定路面 ROI（會記住）、雙擊清除；左上顯示框中心距離。"
             "按 s 存圖（check_dist/）、按 Enter 開始預測角度。"
         )
@@ -267,6 +285,7 @@ class MainWindow(QWidget):
         self.worker.roi = load_roi(config.roi_path, calib.process_size)
         self.worker.frameReady.connect(self._on_frame)
         self.worker.sessionSaved.connect(self._on_saved)
+        self.worker.imuStatus.connect(self._on_imu)
         self.video.roiSelected.connect(self._on_roi)
         self._last_qimg: QImage | None = None  # 最新一幀（含 ROI 框+距離文字），供 s 鍵存圖
         self._shot_dir = Path("check_dist")  # 跟 tool/measure_distance.py 的截圖放一起
@@ -283,24 +302,42 @@ class MainWindow(QWidget):
             msg = "● 預測角度中：滑鼠仍可重拉 ROI、雙擊清除。Ctrl+C / 關閉視窗結束。"
             if self._record:
                 msg = "● 預測角度中（錄影中）：滑鼠仍可重拉 ROI、雙擊清除。關閉視窗結束。"
-            self.hint.setText(msg)
+            self._set_hint(msg)
         else:
             super().keyPressEvent(e)
+
+    def _set_hint(self, msg: str) -> None:
+        """提示列＝訊息 + IMU 狀態標記。
+
+        IMU 狀態刻意只放這裡（Qt 的 QLabel），不上疊圖——疊圖畫面只留 slope/h/roll，
+        見 overlay.py 的取捨；而且 cv2.putText 畫不出中文。
+        """
+        self._hint_base = msg
+        tag = (
+            "　[IMU 已接上：slope＝相對水平面的真實坡度]"
+            if self._imu_ok
+            else "　[無 IMU：顯示的是相機相對 pitch，含安裝俯角]"
+        )
+        self.hint.setText(msg + tag)
+
+    def _on_imu(self, available: bool) -> None:
+        self._imu_ok = available
+        self._set_hint(self._hint_base)
 
     def _save_shot(self) -> None:
         """存最新一幀到 check_dist/sample_NNN.png（遞增、不覆蓋、跨執行接續編號，
         沿用 tool/measure_distance.py 的慣例）。框選階段就能按，不必進辨識/錄影。"""
         if self._last_qimg is None:
-            self.hint.setText("還沒有畫面可存。")
+            self._set_hint("還沒有畫面可存。")
             return
         self._shot_dir.mkdir(parents=True, exist_ok=True)
         existing = [int(m.stem[7:]) for m in self._shot_dir.glob("sample_*.png") if m.stem[7:].isdigit()]
         n = (max(existing) + 1) if existing else 0
         path = self._shot_dir / f"sample_{n:03d}.png"
         if self._last_qimg.save(str(path)):
-            self.hint.setText(f"已存圖 → {path}")
+            self._set_hint(f"已存圖 → {path}")
         else:
-            self.hint.setText(f"存圖失敗：{path}")
+            self._set_hint(f"存圖失敗：{path}")
 
     def _on_roi(self, roi) -> None:
         self.worker.roi = roi
@@ -313,7 +350,7 @@ class MainWindow(QWidget):
 
     def _on_saved(self, seg: str) -> None:
         extra = " + detect.mp4 偵測影片" if self.config.record_detect else ""
-        self.hint.setText(f"已存到 {seg}（cam0/cam1.mp4{extra} + CSV + 趨勢圖）")
+        self._set_hint(f"已存到 {seg}（cam0/cam1.mp4{extra} + CSV + 趨勢圖）")
 
     def closeEvent(self, event) -> None:
         self.worker.stop()

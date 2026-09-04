@@ -18,6 +18,7 @@ import csv
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterator, TextIO
 
@@ -63,6 +64,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", help="輸出 CSV 路徑（離線預設 SEG_DIR/road_angle.csv；即時預設不寫）")
     p.add_argument("--limit", type=int, help="只處理前 N 幀（快速測試/限制即時幀數）")
     p.add_argument("--quiet", action="store_true", help="不要逐幀印出")
+    # 曝光：**只影響即時鏡頭**（離線讀影片時亮度已經錄進去了，改不了）。
+    # 用 dataclasses.replace 套進副本 config，**不寫回 src/config.py**——不打旗標就
+    # 完全等同原本的戶外預設，打了也只影響這一次執行。沿用 tool/measure_distance.py
+    # 已有的同名旗標慣例（那支工具也是這樣做，兩邊互不影響）。
+    p.add_argument(
+        "--shutter", type=int, metavar="US",
+        help=f"即時快門 µs（預設 {DEFAULT.live_shutter_us}＝戶外白天；室內昏暗試 20000）",
+    )
+    p.add_argument(
+        "--gain", type=float, metavar="G",
+        help=f"即時類比增益（預設 {DEFAULT.live_gain}＝戶外白天；室內昏暗試 4.0）",
+    )
     return p
 
 
@@ -144,7 +157,25 @@ def _print_summary(pitches: list[float]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    calib = load_calibration(args.calib, process_scale=DEFAULT.process_scale)
+
+    # 曝光旗標 → 副本 config。沒打旗標時 cfg 就是 DEFAULT 本身（行為完全不變）；
+    # 打了也只活在這次執行的記憶體裡，src/config.py 的預設值不受影響。
+    cfg = DEFAULT
+    if args.shutter is not None or args.gain is not None:
+        cfg = replace(
+            DEFAULT,
+            live_shutter_us=DEFAULT.live_shutter_us if args.shutter is None else args.shutter,
+            live_gain=DEFAULT.live_gain if args.gain is None else args.gain,
+        )
+        print(
+            f"曝光覆寫（僅本次執行）：shutter={cfg.live_shutter_us}µs gain={cfg.live_gain}"
+            f"（預設 {DEFAULT.live_shutter_us}µs/{DEFAULT.live_gain}，src/config.py 未改動）"
+        )
+        if not args.live:
+            print("注意：--shutter/--gain 只對 --live 的即時鏡頭有效，離線讀影片無作用。",
+                  file=sys.stderr)
+
+    calib = load_calibration(args.calib, process_scale=cfg.process_scale)
     print(
         f"calib: baseline={calib.baseline_mm:.1f}mm, "
         f"reproj_error={calib.reproj_error:.3f}px, "
@@ -153,20 +184,20 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # 介面開關：CLI --ui/--no-ui 優先，否則用 config.show_ui
-    show_ui = DEFAULT.show_ui if args.ui is None else args.ui
-    record = DEFAULT.record  # 錄影一律開啟（config.record）
+    show_ui = cfg.show_ui if args.ui is None else args.ui
+    record = cfg.record  # 錄影一律開啟（config.record）
 
     if args.live:
         if show_ui:
             from .ui import run_ui
 
             print("開啟 PyQt 視覺介面。")
-            return run_ui(calib, DEFAULT, record=record)
-        return _run_live(calib, args, record=record)
-    return _run_segment(calib, args)
+            return run_ui(calib, cfg, record=record)
+        return _run_live(calib, args, cfg, record=record)
+    return _run_segment(calib, args, cfg)
 
 
-def _run_segment(calib, args) -> int:
+def _run_segment(calib, args, cfg=DEFAULT) -> int:
     if not args.seg_dir and not (args.cam0 and args.cam1):
         print("錯誤：需要 SEG_DIR，或同時給 --cam0 與 --cam1（或用 --live 接鏡頭）。", file=sys.stderr)
         return 2
@@ -174,7 +205,7 @@ def _run_segment(calib, args) -> int:
     seg_dir = args.seg_dir or "."
     out_path = Path(args.out) if args.out else Path(seg_dir) / "road_angle.csv"
     results = process_segment(
-        calib, seg_dir, config=DEFAULT, cam0_mp4=args.cam0, cam1_mp4=args.cam1
+        calib, seg_dir, config=cfg, cam0_mp4=args.cam0, cam1_mp4=args.cam1
     )
     with _open_csv(out_path) as (f, writer):
         pitches = _consume(
@@ -185,30 +216,30 @@ def _run_segment(calib, args) -> int:
     return 0
 
 
-def _run_live(calib, args, *, record: bool = False) -> int:
+def _run_live(calib, args, cfg=DEFAULT, *, record: bool = False) -> int:
     print("即時模式：接兩顆鏡頭，Ctrl+C 停止。")
     recorder = None
     if record:
         from .recorder import SessionRecorder
 
         recorder = SessionRecorder(
-            DEFAULT.output_dir, calib.native_size, DEFAULT.record_fps, DEFAULT.segment_seconds
+            cfg.output_dir, calib.native_size, cfg.record_fps, cfg.segment_seconds
         )
-        print(f"錄影中 → {recorder.dir}（每 {DEFAULT.segment_seconds:.0f} 秒收一段）")
+        print(f"錄影中 → {recorder.dir}（每 {cfg.segment_seconds:.0f} 秒收一段）")
     from .roi_store import load_roi  # headless 沿用 UI 記住的 ROI（roi.json）
 
-    roi = load_roi(DEFAULT.roi_path, calib.process_size)
+    roi = load_roi(cfg.roi_path, calib.process_size)
     if roi is not None:
-        print(f"套用記住的 ROI {roi}（來自 {DEFAULT.roi_path}；UI 拉框設定/雙擊清除）")
+        print(f"套用記住的 ROI {roi}（來自 {cfg.roi_path}；UI 拉框設定/雙擊清除）")
     from .imu import ImuReader  # IMU 輔助（config.use_imu 關閉時 available=False，不影響）
 
     pitches: list[float] = []
-    with ImuReader(DEFAULT) as imu:
+    with ImuReader(cfg) as imu:
         # 有錄影就順便畫疊圖存 detect.mp4（跟 --ui 看到的同一張畫面）。headless 本來
         # 不畫圖，開了會慢一點；不要就把 config.record_detect 設 False。
-        annotate = recorder is not None and DEFAULT.record_detect
+        annotate = recorder is not None and cfg.record_detect
         results = process_live(
-            calib, config=DEFAULT, max_frames=args.limit, recorder=recorder, roi=roi,
+            calib, config=cfg, max_frames=args.limit, recorder=recorder, roi=roi,
             imu=imu, annotate=annotate,
         )
         writer_ctx = _open_csv(Path(args.out)) if args.out else _null_csv()
@@ -223,8 +254,8 @@ def _run_live(calib, args, *, record: bool = False) -> int:
             if recorder is not None:
                 recorder.close()
                 n = len(recorder.segments)
-                det = ", detect.mp4" if DEFAULT.record_detect else ""
-                print(f"已存 {n} 段 → {DEFAULT.output_dir}/（每段含 cam0/cam1.mp4{det}, road_angle.csv, road_angle_trend.png）")
+                det = ", detect.mp4" if cfg.record_detect else ""
+                print(f"已存 {n} 段 → {cfg.output_dir}/（每段含 cam0/cam1.mp4{det}, road_angle.csv, road_angle_trend.png）")
     if args.out:
         print(f"CSV → {args.out}")
     _print_summary(pitches)

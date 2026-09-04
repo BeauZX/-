@@ -146,16 +146,25 @@ class SessionRecorder:
         # [r.roll_deg for r in self._results]。
         # 有 IMU 輔助（任一幀算出相對水平坡度）就畫 slope(pitch_gravity)，扣掉安裝俯角，
         # 綠線會落在真實坡度附近；否則退回純雙目 pitch（相對相機光軸、含安裝俯角）。
+        # 圖畫的是「扣掉基準的偏差」＝0 平路、正上坡、負下坡（見 plot.save_angle_trend）。
+        # 基準怎麼定，決定這張圖是絕對坡度還是只有相對變化——用 baseline_label 寫進 Y 軸。
         has_imu = any(r.pitch_gravity_deg is not None for r in self._results)
         if has_imu:
             pit = [r.pitch_gravity_deg for r in self._results]
-            title, label = "Road slope trend (gravity-referenced)", "slope (gravity-ref)"
+            title, label = "路面坡度趨勢（相對水平面，有 IMU）", "坡度"
+            base = 0.0  # IMU 已扣掉安裝俯角，0 就是真正的水平面
+            zero = "水平面"  # 殘餘 1~2° 安裝零點待平地校正，見 CLAUDE.md
         else:
             pit = [r.pitch_deg for r in self._results]
-            title, label = "Road pitch trend", "pitch (longitudinal)"
+            title, label = "路面坡度趨勢（無 IMU）", "坡度變化"
+            base = None  # 沒有絕對零點 → 用本段中位數
+            # 下緣註明 0 是「本段中位數」而非水平面：整段都下坡時圖會畫成平的，
+            # 這是唯一能防止誤讀的資訊，不能省。
+            zero = "本段中位數"
         save_angle_trend(
             str(self.dir / "road_angle_trend.png"), idx, pit, rolls=None,
-            title=title, pitch_label=label,
+            title=title, pitch_label=label, baseline=base, baseline_label=zero,
+            fps=self.fps,
         )
 
 

@@ -13,3 +13,4 @@ roi.json
 check_dist/
 # Virtual environments
 .venv
+live_video_output_20260904/

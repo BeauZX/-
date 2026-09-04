@@ -57,6 +57,9 @@ class Config:
     # 對齊 rpi5_dual_camera_capture.py 錄影時的 SHUTTER_US=2000/GAIN=1.0（戶外白天亮光；
     # 實測 Lux≈17000 下自動曝光也收斂到 ≈2022µs/1.0）。室內昏暗會太黑→調大(如 20000/4.0)。
     # 解析度不在這裡：即時強制用 calib.image_size（校正綁定的解析度）。
+    # 室內臨時要變亮**不用改這兩行**，下指令覆寫就好（只影響那次執行）：
+    #     python3 main.py --live --ui --shutter 20000 --gain 4.0
+    # 走 dataclasses.replace 套進副本 config，這裡的預設值不受影響。見 main.py 的說明。
     live_shutter_us: int = 2000  # 固定快門 (µs)，戶外白天
     live_gain: float = 1.0  # 固定類比增益，戶外光線充足
     live_cam0_index: int = 0  # Picamera2 index：0 = i2c@88000 = cam0(左)
@@ -91,7 +94,7 @@ class Config:
     # 並輸出 road_angle.csv + road_angle_trend.png。
     # 註：離線 run_video.py 另外用 replace(output_dir="output_videos") 覆寫，不受這裡影響。
     record: bool = True
-    output_dir: str = "live_video_output"
+    output_dir: str = "live_video_output_20260904"
     record_fps: float = 10.0  # 影片名義 fps（實際變動，播放速度為近似）
     # 每滿這麼多秒就把當前 segment 收好（寫 CSV/趨勢圖、封 mp4）、換下一段遞增編號。
     # 好處：即時模式跑越久也不怕中途掛掉——最多只損失最後不到這段時間的資料。
